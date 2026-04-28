@@ -77,11 +77,11 @@ def drive_heading(current_angle, target_angle, safety=False):
 
     if safety:
         if diff > 0:
-            left = -350
-            right = 650
-        else:
             left = 650
             right = -350
+        else:
+            left = -350
+            right = 650
 
         left = clamp_speed(left)
         right = clamp_speed(right)
