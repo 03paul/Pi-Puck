@@ -1,355 +1,345 @@
-import paho.mqtt.client as mqtt
 import json
-import time
 import math
+import threading
+import time
+
+import paho.mqtt.client as mqtt
 from pipuck.pipuck import PiPuck
+
 
 # =========================
 # CONFIG
 # =========================
 BROKER = "192.168.178.43"
 PORT = 1883
-MY_ID = 39  
+TOPIC = "robot_pos/all"
+MY_ID = "39"
 
-# Distanzen
-RAM_TRIGGER_DIST = 0.35    # Ab 35cm Entfernung wird "gelockt" und gerammt
-IMPACT_DIST = 0.12         # Wann wir stoppen/zurücksetzen
+ARENA_X_MIN = 0.0
+ARENA_X_MAX = 2.0
+ARENA_Y_MIN = 0.0
+ARENA_Y_MAX = 1.0
 
-# Geschwindigkeiten
-SPEED_APPROACH = 450       # Langsames Heranfahren
-SPEED_RAM = 1000           # Die versprochenen 1000
-SPEED_BACKOFF = -400
+# Safety
+MQTT_TIMEOUT_S = 0.75
+EDGE_MARGIN_M = 0.08
 
-SAFE_MARGIN = 0.20     # gewünschter Abstand zum Rand
-HARD_MARGIN = 0.05     # Notfallzone
-OBSTACLE_AVOIDANCE_MARGIN = 0.30
+# Target behavior
+CATCH_DISTANCE_M = 0.12
+CATCH_RELEASE_DISTANCE_M = 0.16
+FAST_DISTANCE_M = 0.70
+MIN_APPROACH_SPEED = 250
+MAX_SPEED = 1000
 
-BASE_SPEED = 350
-STEER_GAIN = 2.0
-MAX_CORRECTION = 100
+# Steering behavior
+LOOP_PERIOD_S = 0.05
+TURN_IN_PLACE_DEG = 45.0
+AIM_OK_DEG = 6.0
+TURN_GAIN = 9.0
+STEER_GAIN = 7.0
+MAX_TURN_SPEED = 650
+MAX_STEER_CORRECTION = 500
 
+# Set this to -1 if the robot steers away from the target instead of toward it.
 STEERING_SIGN = 1
-# Präzision
-AIM_TOLERANCE = 3.5        # Grad-Toleranz (nicht zu eng, sonst zappelt er)
-MIN_TURN_SPEED = 200       # Mindestkraft zum Drehen (gegen Reibung)
 
+
+# =========================
+# SHARED MQTT STATE
+# =========================
+positions_lock = threading.Lock()
 robot_positions = {}
-mode = "SELECT_TARGET"
-target_ids = []
-target_index = 0
-current_target_id = None
-timer_start = 0
+last_message_time = 0.0
+
 
 # =========================
-# MATH
+# MATH / DATA HELPERS
 # =========================
+def clamp(value, low, high):
+    return max(low, min(high, value))
 
-def get_vector(my_pos, tar_pos):
-    dx = tar_pos["x"] - my_pos["x"]
-    dy = tar_pos["y"] - my_pos["y"]
-    dist = math.sqrt(dx**2 + dy**2)
-    # Winkel zum Ziel (0-360)
-    angle = math.degrees(math.atan2(dy, dx)) % 360
-    return dist, angle
 
-def get_angle_diff(target, current):
-    # Kürzester Drehweg zwischen -180 und 180
-    return (target - current + 180) % 360 - 180
+def angle_diff_deg(target_deg, current_deg):
+    """Shortest signed difference target-current in degrees, range [-180, 180)."""
+    return (target_deg - current_deg + 180.0) % 360.0 - 180.0
+
+
+def parse_robot_state(raw):
+    if not isinstance(raw, dict):
+        return None
+
+    pos = raw.get("position")
+    angle = raw.get("angle")
+    if not isinstance(pos, (list, tuple)) or len(pos) < 2 or angle is None:
+        return None
+
+    try:
+        return {
+            "x": float(pos[0]),
+            "y": float(pos[1]),
+            "angle": float(angle) % 360.0,
+        }
+    except (TypeError, ValueError):
+        return None
+
+
+def get_snapshot():
+    with positions_lock:
+        return dict(robot_positions), last_message_time
+
+
+def get_my_state(positions):
+    return parse_robot_state(positions.get(MY_ID))
+
+
+def distance_and_angle(from_state, to_state):
+    dx = to_state["x"] - from_state["x"]
+    dy = to_state["y"] - from_state["y"]
+    distance = math.hypot(dx, dy)
+    angle = math.degrees(math.atan2(dy, dx)) % 360.0
+    return distance, angle
+
+
+def find_closest_robot(my_state, positions):
+    closest_id = None
+    closest_state = None
+    closest_distance = float("inf")
+
+    for robot_id, raw_state in positions.items():
+        if str(robot_id) == MY_ID:
+            continue
+
+        other_state = parse_robot_state(raw_state)
+        if other_state is None:
+            continue
+
+        distance, _ = distance_and_angle(my_state, other_state)
+        if distance < closest_distance:
+            closest_id = str(robot_id)
+            closest_state = other_state
+            closest_distance = distance
+
+    return closest_id, closest_state, closest_distance
+
+
+def too_close_to_edge(state):
+    return (
+        state["x"] <= ARENA_X_MIN + EDGE_MARGIN_M
+        or state["x"] >= ARENA_X_MAX - EDGE_MARGIN_M
+        or state["y"] <= ARENA_Y_MIN + EDGE_MARGIN_M
+        or state["y"] >= ARENA_Y_MAX - EDGE_MARGIN_M
+    )
+
+
+def speed_for_distance(distance_m):
+    if distance_m <= CATCH_DISTANCE_M:
+        return 0
+    if distance_m >= FAST_DISTANCE_M:
+        return MAX_SPEED
+
+    span = FAST_DISTANCE_M - CATCH_DISTANCE_M
+    factor = (distance_m - CATCH_DISTANCE_M) / span
+    speed = MIN_APPROACH_SPEED + factor * (MAX_SPEED - MIN_APPROACH_SPEED)
+    return int(clamp(speed, MIN_APPROACH_SPEED, MAX_SPEED))
+
 
 # =========================
-# CONTROL
+# ROBOT CONTROL
 # =========================
 pipuck = PiPuck(epuck_version=2)
 
-def set_motors(l, r):
-    pipuck.epuck.set_motor_speeds(int(max(-1024, min(1024, l))), 
-                                  int(max(-1024, min(1024, r))))
 
-def stop():
+def set_motors(left, right):
+    left = int(clamp(left, -MAX_SPEED, MAX_SPEED))
+    right = int(clamp(right, -MAX_SPEED, MAX_SPEED))
+    pipuck.epuck.set_motor_speeds(left, right)
+
+
+def stop_motors():
     set_motors(0, 0)
+
+
+def drive_toward_target(my_state, target_state, distance_m):
+    _, target_angle = distance_and_angle(my_state, target_state)
+    diff = angle_diff_deg(target_angle, my_state["angle"])
+    signed_diff = STEERING_SIGN * diff
+
+    if abs(diff) > TURN_IN_PLACE_DEG:
+        turn = clamp(signed_diff * TURN_GAIN, -MAX_TURN_SPEED, MAX_TURN_SPEED)
+        if abs(turn) < 220:
+            turn = 220 if turn >= 0 else -220
+        set_motors(-turn, turn)
+        return target_angle, diff, 0
+
+    speed = speed_for_distance(distance_m)
+    if abs(diff) <= AIM_OK_DEG:
+        correction = 0
+    else:
+        correction = clamp(
+            signed_diff * STEER_GAIN,
+            -MAX_STEER_CORRECTION,
+            MAX_STEER_CORRECTION,
+        )
+
+    left = speed - correction
+    right = speed + correction
+    set_motors(left, right)
+    return target_angle, diff, speed
+
 
 # =========================
 # MQTT
 # =========================
-def on_message(client, userdata, msg):
-    global robot_positions
+def on_connect(client, userdata, flags, reason_code, properties=None):
     try:
-        robot_positions = json.loads(msg.payload.decode())
-    except:
-        pass
+        success = int(reason_code) == 0
+    except (TypeError, ValueError):
+        success = str(reason_code).lower() == "success"
+
+    if success:
+        client.subscribe(TOPIC)
+        print(f"MQTT connected, subscribed to {TOPIC}")
+    else:
+        print(f"MQTT connect failed: {reason_code}")
 
 
-# ================= HELPERS =================
-
-def angle_diff(target, current):
-    return (target - current + 180) % 360 - 180
-
-def get_my_state():
-    rid = str(MY_ID)
-
-    if rid not in robot_positions:
-        return None
-
-    data = robot_positions[rid]
-
-    return {
-        "x": data["position"][0],
-        "y": data["position"][1],
-        "angle": data["angle"]
-    }
-
-def get_closest_obstacle(my_x, my_y):
-    closest_dist = float('inf')
-    for rid, data in robot_positions.items():
-        if rid == str(MY_ID): continue
-        x = data["position"][0]
-        y = data["position"][1]
-        dist = ((x - my_x)**2 + (y - my_y)**2)**0.5
-        if dist < closest_dist:
-            closest_dist = dist
-    return closest_dist
+def on_disconnect(client, userdata, *args):
+    print("MQTT disconnected")
+    stop_motors()
 
 
-# ================= ROBOT =================
+def on_message(client, userdata, msg):
+    global robot_positions, last_message_time
 
-pipuck = PiPuck(epuck_version=2)
+    try:
+        payload = msg.payload.decode("utf-8")
+        data = json.loads(payload)
+        if not isinstance(data, dict):
+            return
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return
 
-def stop():
-    pipuck.epuck.set_motor_speeds(0, 0)
-
-def drive_heading(current_angle, target_angle):
-    diff = angle_diff(target_angle, current_angle)
-
-    correction = STEERING_SIGN * STEER_GAIN * diff
-    correction = max(-MAX_CORRECTION, min(MAX_CORRECTION, correction))
-
-    left = int(BASE_SPEED - correction)
-    right = int(BASE_SPEED + correction)
-
-    # 🔴 NIE Rückwärts → verhindert Kreis-Spin
-    left = max(200, left)
-    right = max(200, right)
-
-    pipuck.epuck.set_motor_speeds(left, right)
-
-    return diff, left, right
+    with positions_lock:
+        robot_positions = data
+        last_message_time = time.monotonic()
 
 
-# ================= SAFETY =================
+def create_mqtt_client():
+    client_id = f"pipuck_chaser_{MY_ID}"
 
-def safety_override(x, y):
-    """
-    Wenn zu nah am Rand → sofort ins Feld zurücklenken
-    """
+    if hasattr(mqtt, "CallbackAPIVersion"):
+        client = mqtt.Client(
+            mqtt.CallbackAPIVersion.VERSION2,
+            client_id=client_id,
+        )
+    else:
+        client = mqtt.Client(client_id=client_id)
 
-    if x < X_MIN + HARD_MARGIN:
-        return 0      # nach rechts
-    if x > X_MAX - HARD_MARGIN:
-        return 180    # nach links
-    if y < Y_MIN + HARD_MARGIN:
-        return 90     # nach oben
-    if y > Y_MAX - HARD_MARGIN:
-        return 270    # nach unten
+    client.on_connect = on_connect
+    client.on_disconnect = on_disconnect
+    client.on_message = on_message
+    return client
 
-    return None
-
-
-def detect_wall(x, y):
-    if x <= X_MIN + SAFE_MARGIN:
-        return "left"
-    if x >= X_MAX - SAFE_MARGIN:
-        return "right"
-    if y <= Y_MIN + SAFE_MARGIN:
-        return "bottom"
-    if y >= Y_MAX - SAFE_MARGIN:
-        return "top"
-    return None
-
-
-def wall_follow_target(wall, x, y):
-    """
-    Uhrzeigersinn entlang Rand.
-    Proportional-Regler (PD) hält den Roboter auf exakt SAFE_MARGIN Abstand.
-    """
-    STEER_P = 150  # Korrektur-Winkel pro 1m Abweichung
-
-    if wall == "bottom":
-        # Fahrtrichtung: 0 (Rechts), Wunschlinie: y = Y_MIN + SAFE_MARGIN
-        error = (Y_MIN + SAFE_MARGIN) - y
-        error = max(-0.5, min(0.5, error))
-        target = (0 + error * STEER_P) % 360
-        if x >= X_MAX - SAFE_MARGIN:
-            return "right", 90
-        return "bottom", target
-
-    if wall == "right":
-        # Fahrtrichtung: 90 (Oben), Wunschlinie: x = X_MAX - SAFE_MARGIN
-        error = x - (X_MAX - SAFE_MARGIN)
-        error = max(-0.5, min(0.5, error))
-        target = (90 + error * STEER_P) % 360
-        if y >= Y_MAX - SAFE_MARGIN:
-            return "top", 180
-        return "right", target
-
-    if wall == "top":
-        # Fahrtrichtung: 180 (Links), Wunschlinie: y = Y_MAX - SAFE_MARGIN
-        error = y - (Y_MAX - SAFE_MARGIN)
-        error = max(-0.5, min(0.5, error))
-        target = (180 + error * STEER_P) % 360
-        if x <= X_MIN + SAFE_MARGIN:
-            return "left", 270
-        return "top", target
-
-    if wall == "left":
-        # Fahrtrichtung: 270 (Unten), Wunschlinie: x = X_MIN + SAFE_MARGIN
-        error = (X_MIN + SAFE_MARGIN) - x
-        error = max(-0.5, min(0.5, error))
-        target = (270 + error * STEER_P) % 360
-        if y <= Y_MIN + SAFE_MARGIN:
-            return "bottom", 0
-        return "left", target
-
-    return wall, 0
-
-
-# ================= MAIN =================
-    except: pass
->>>>>>> 3da9deb2544467e00c068279bedcf06b3c35a346
-
-client = mqtt.Client()
-client.on_message = on_message
-client.connect(BROKER, PORT, 60)
-client.subscribe("robot_pos/all")
-client.loop_start()
-
-def get_state(rid):
-    rid_s = str(rid)
-    if rid_s in robot_positions:
-        d = robot_positions[rid_s]
-        # Falls Position als [x, y] kommt
-        return {"x": d["position"][0], "y": d["position"][1], "angle": d["angle"]}
-    return None
 
 # =========================
 # MAIN LOOP
 # =========================
-try:
-    print(f"PiPuck {MY_ID} bereit. Suche Ziele...")
-    
-    while True:
-        my = get_state(MY_ID)
-        if not my:
-            time.sleep(0.1)
-            continue
+def main():
+    client = create_mqtt_client()
+    client.connect(BROKER, PORT, keepalive=60)
+    client.loop_start()
 
-        if mode == "SELECT_TARGET":
-            target_ids = sorted([int(rid) for rid in robot_positions.keys() if int(rid) != MY_ID])
-            if target_ids:
-                current_target_id = target_ids[target_index % len(target_ids)]
-                print(f"Ziel fixiert: ID {current_target_id}")
-                mode = "AIM"
-            else:
-                stop()
+    last_status = None
+    last_debug_time = 0.0
+    caught_robot_id = None
 
-        # 🔴 HARD SAFETY FIRST
-        safety_target = safety_override(x, y)
-        closest_obstacle_dist = get_closest_obstacle(x, y)
+    def status(text):
+        nonlocal last_status
+        if text != last_status:
+            print(text)
+            last_status = text
 
-        if closest_obstacle_dist < OBSTACLE_AVOIDANCE_MARGIN:
-            target = (angle + 180) % 360  # Wende um 180 Grad
-            mode = "OBSTACLE_AVOIDANCE"
-        elif safety_target is not None:
-            target = safety_target
-            mode = "SAFETY"
+    try:
+        print(f"PiPuck {MY_ID} started")
 
-        else:
-            # Falls wir gerade aus einer Notfallzone kommen, gehe zurück in den Normalzustand
-            if mode in ["SAFETY", "OBSTACLE_AVOIDANCE"]:
-                mode = "FOLLOW_WALL" if current_wall else "GO_STRAIGHT"
+        while True:
+            now = time.monotonic()
+            positions, message_time = get_snapshot()
+            data_age = now - message_time if message_time > 0 else float("inf")
 
-            if start_angle is None:
-                start_angle = angle
-        elif mode == "AIM":
-            tar = get_state(current_target_id)
-            if not tar: 
-                mode = "SELECT_TARGET"; continue
-            
-            dist, target_angle = get_vector(my, tar)
-            diff = get_angle_diff(target_angle, my["angle"])
-            
-            # DEBUG
-            if int(time.time()*10) % 5 == 0:
-                print(f"Aiming: Ist {my['angle']:.1f}°, Ziel {target_angle:.1f}°, Diff {diff:.1f}°")
-
-            if abs(diff) < AIM_TOLERANCE:
-                stop()
-                print(">>> Winkel fixiert! Starte Anflug.")
-                mode = "APPROACH"
-            else:
-                # Sanftes Drehen mit Mindestgeschwindigkeit gegen Reibung
-                turn_speed = diff * 5.0 
-                if turn_speed > 0: turn_speed = max(min(turn_speed, 500), MIN_TURN_SPEED)
-                else: turn_speed = min(max(turn_speed, -500), -MIN_TURN_SPEED)
-                set_motors(turn_speed, -turn_speed)
-
-        elif mode == "APPROACH":
-            tar = get_state(current_target_id)
-            if not tar: mode = "SELECT_TARGET"; continue
-                
-            dist, target_angle = get_vector(my, tar)
-            diff = get_angle_diff(target_angle, my["angle"])
-            
-            # Wenn wir im "Charge-Bereich" sind, schalten wir die Lenkung aus!
-            if dist < RAM_TRIGGER_DIST:
-                print(">>> RAMMEN MIT TEMPO 1000!")
-                mode = "CHARGE"
+            if data_age > MQTT_TIMEOUT_S:
+                stop_motors()
+                status("Stopping: no fresh MQTT data")
+                time.sleep(LOOP_PERIOD_S)
                 continue
 
-            # Während der langsamen Fahrt Kurs halten
-            # Wir lassen eine größere Toleranz (15°) zu, bevor wir abbrechen
-            if abs(diff) > 25:
-                print("Kurs verloren, korrigiere...")
-                mode = "AIM"
+            my_state = get_my_state(positions)
+            if my_state is None:
+                stop_motors()
+                status(f"Stopping: own robot {MY_ID} missing in MQTT data")
+                time.sleep(LOOP_PERIOD_S)
                 continue
 
-            correction = diff * 4.0
-            set_motors(SPEED_APPROACH - correction, SPEED_APPROACH + correction)
+            if too_close_to_edge(my_state):
+                stop_motors()
+                status(
+                    "Stopping: too close to edge "
+                    f"(x={my_state['x']:.3f}, y={my_state['y']:.3f})"
+                )
+                time.sleep(LOOP_PERIOD_S)
+                continue
 
-        elif mode == "CHARGE":
-            # KEINE BERECHNUNG MEHR. Einfach Vollgas geradeaus.
-            set_motors(SPEED_RAM, SPEED_RAM)
-            
-            tar = get_state(current_target_id)
-            if tar:
-                dist, _ = get_vector(my, tar)
-                if dist < IMPACT_DIST:
-                    print("TREFFER!")
-                    timer_start = time.time()
-                    mode = "IMPACT_HOLD"
-            else:
-                # Falls Ziel weg, kurz weiterhämmern, dann SELECT
-                time.sleep(0.2)
-                mode = "BACKOFF"
+            target_id, target_state, distance_m = find_closest_robot(
+                my_state,
+                positions,
+            )
+            if target_id is None:
+                stop_motors()
+                status("Stopping: no other robot found")
+                time.sleep(LOOP_PERIOD_S)
+                continue
 
-            if mode == "FOLLOW_WALL":
-                current_wall, target = wall_follow_target(current_wall, x, y)
-        elif mode == "IMPACT_HOLD":
-            set_motors(SPEED_RAM, SPEED_RAM) # Weiter drücken
-            if time.time() - timer_start > 0.3:
-                timer_start = time.time()
-                mode = "BACKOFF"
+            if distance_m <= CATCH_DISTANCE_M:
+                stop_motors()
+                if caught_robot_id != target_id:
+                    print(f"CAUGHT ROBOT {target_id}")
+                    caught_robot_id = target_id
+                status(f"Target {target_id} caught at {distance_m:.3f} m")
+                time.sleep(LOOP_PERIOD_S)
+                continue
 
-        elif mode == "BACKOFF":
-            set_motors(SPEED_BACKOFF, SPEED_BACKOFF)
-            if time.time() - timer_start > 0.5:
-                stop()
-                target_index += 1
-                mode = "SELECT_TARGET"
+            if caught_robot_id == target_id and distance_m > CATCH_RELEASE_DISTANCE_M:
+                caught_robot_id = None
 
-        time.sleep(0.03)
+            target_angle, diff, speed = drive_toward_target(
+                my_state,
+                target_state,
+                distance_m,
+            )
+            status(f"Chasing robot {target_id}")
 
-except KeyboardInterrupt:
-    print("Beendet.")
-finally:
-    stop()
-    client.loop_stop()
+            if now - last_debug_time >= 0.5:
+                print(
+                    f"target={target_id} dist={distance_m:.3f}m "
+                    f"my_angle={my_state['angle']:.1f}deg "
+                    f"target_angle={target_angle:.1f}deg "
+                    f"diff={diff:.1f}deg speed={speed}"
+                )
+                last_debug_time = now
+
+            time.sleep(LOOP_PERIOD_S)
+
+    except KeyboardInterrupt:
+        print("KeyboardInterrupt: stopping robot")
+    finally:
+        stop_motors()
+        client.loop_stop()
+        try:
+            client.disconnect()
+        except Exception:
+            pass
+        print("Stopped")
+
+
+if __name__ == "__main__":
+    main()
