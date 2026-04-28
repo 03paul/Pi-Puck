@@ -1,3 +1,4 @@
+# CODEX UPDATED THIS FILE - MOTION HEADING NO-SPIN VERSION
 import json
 import math
 import threading
@@ -7,8 +8,7 @@ import paho.mqtt.client as mqtt
 from pipuck.pipuck import PiPuck
 
 
-CLIENT_VERSION = "no-circle-forward-only-v3"
-
+CLIENT_VERSION = "motion-heading-no-spin-v4"
 
 # =========================
 # CONFIG
@@ -31,24 +31,26 @@ EDGE_MARGIN_M = 0.08
 CATCH_DISTANCE_M = 0.12
 CATCH_RELEASE_DISTANCE_M = 0.16
 FAST_DISTANCE_M = 0.70
-MIN_APPROACH_SPEED = 250
+MIN_APPROACH_SPEED = 240
 MAX_SPEED = 1000
 
-# Steering behavior
+# Motion-heading control
 LOOP_PERIOD_S = 0.05
-AIM_OK_DEG = 6.0
-STEER_GAIN = 0.85
-SHARP_TURN_DEG = 70.0
-SHARP_TURN_SPEED = 220
-MIN_MOVING_SPEED = 120
-ANGLE_UNIT = "auto"  # "auto", "degrees", or "radians"
-ANGLE_SIGN = 1       # set to -1 if the MQTT angle grows in the wrong direction
-ANGLE_OFFSET_DEG = 0 # try 90, -90, or 180 if the tracked front is rotated
-USE_MOTION_HEADING = True
-MOTION_HEADING_MIN_STEP_M = 0.015
+BOOTSTRAP_SPEED = 220
+BOOTSTRAP_MOVE_M = 0.025
+HEADING_MIN_STEP_M = 0.012
+STRAIGHT_TOLERANCE_DEG = 12.0
+SHARP_TURN_DEG = 65.0
+TURN_SPEED = 240
+INNER_WHEEL_RATIO = 0.45
+MIN_WHEEL_SPEED = 110
 
-# Set this to -1 if the robot steers away from the target instead of toward it.
+# Flip this to -1 if the robot consistently curves away from the target.
 STEERING_SIGN = 1
+
+# If one motor is mounted/reported reversed, change its sign to -1.
+LEFT_MOTOR_SIGN = 1
+RIGHT_MOTOR_SIGN = 1
 
 
 # =========================
@@ -67,21 +69,7 @@ def clamp(value, low, high):
 
 
 def angle_diff_deg(target_deg, current_deg):
-    """Shortest signed difference target-current in degrees, range [-180, 180)."""
     return (target_deg - current_deg + 180.0) % 360.0 - 180.0
-
-
-def normalize_angle_deg(raw_angle):
-    angle = float(raw_angle)
-
-    if ANGLE_UNIT == "radians":
-        angle = math.degrees(angle)
-    if ANGLE_UNIT == "degrees":
-        angle = angle
-    elif -2.0 * math.pi <= angle <= 2.0 * math.pi:
-        angle = math.degrees(angle)
-
-    return (ANGLE_SIGN * angle + ANGLE_OFFSET_DEG) % 360.0
 
 
 def parse_robot_state(raw):
@@ -89,15 +77,15 @@ def parse_robot_state(raw):
         return None
 
     pos = raw.get("position")
-    angle = raw.get("angle")
-    if not isinstance(pos, (list, tuple)) or len(pos) < 2 or angle is None:
+    angle = raw.get("angle", 0.0)
+    if not isinstance(pos, (list, tuple)) or len(pos) < 2:
         return None
 
     try:
         return {
             "x": float(pos[0]),
             "y": float(pos[1]),
-            "angle": normalize_angle_deg(angle),
+            "angle": float(angle) % 360.0,
         }
     except (TypeError, ValueError):
         return None
@@ -170,45 +158,45 @@ pipuck = PiPuck(epuck_version=2)
 
 
 def set_motors(left, right):
-    left = int(clamp(left, -MAX_SPEED, MAX_SPEED))
-    right = int(clamp(right, -MAX_SPEED, MAX_SPEED))
+    left = int(clamp(left, 0, MAX_SPEED)) * LEFT_MOTOR_SIGN
+    right = int(clamp(right, 0, MAX_SPEED)) * RIGHT_MOTOR_SIGN
     pipuck.epuck.set_motor_speeds(left, right)
 
 
 def stop_motors():
-    set_motors(0, 0)
+    pipuck.epuck.set_motor_speeds(0, 0)
 
 
-def drive_toward_target(my_state, target_state, distance_m, steering_sign):
-    _, target_angle = distance_and_angle(my_state, target_state)
-    diff = angle_diff_deg(target_angle, my_state["angle"])
+def drive_straight(speed):
+    speed = int(clamp(speed, 0, MAX_SPEED))
+    set_motors(speed, speed)
+    return speed, speed
+
+
+def drive_toward_heading(heading_deg, target_state, my_state, steering_sign):
+    distance_m, target_angle = distance_and_angle(my_state, target_state)
+    diff = angle_diff_deg(target_angle, heading_deg)
     signed_diff = steering_sign * diff
 
+    if abs(diff) <= STRAIGHT_TOLERANCE_DEG:
+        speed = speed_for_distance(distance_m)
+        left, right = drive_straight(speed)
+        return target_angle, diff, speed, left, right
+
     speed = speed_for_distance(distance_m)
-    if abs(diff) > SHARP_TURN_DEG:
-        speed = min(speed, SHARP_TURN_SPEED)
+    if abs(diff) >= SHARP_TURN_DEG:
+        speed = min(speed, TURN_SPEED)
 
-    if abs(diff) <= AIM_OK_DEG:
-        left = speed
-        right = speed
-    elif signed_diff > 0:
-        turn_ratio = clamp(abs(diff) / 100.0 * STEER_GAIN, 0.15, 0.80)
-        left = speed * (1.0 - turn_ratio)
-        right = speed
-    else:
-        turn_ratio = clamp(abs(diff) / 100.0 * STEER_GAIN, 0.15, 0.80)
-        left = speed
-        right = speed * (1.0 - turn_ratio)
+    outer = max(speed, MIN_WHEEL_SPEED)
+    inner = max(int(outer * INNER_WHEEL_RATIO), MIN_WHEEL_SPEED)
 
-    if speed > 0:
-        left = clamp(left, MIN_MOVING_SPEED, MAX_SPEED)
-        right = clamp(right, MIN_MOVING_SPEED, MAX_SPEED)
+    if signed_diff > 0:
+        left, right = inner, outer
     else:
-        left = 0
-        right = 0
+        left, right = outer, inner
 
     set_motors(left, right)
-    return target_angle, diff, speed, int(left), int(right)
+    return target_angle, diff, speed, left, right
 
 
 # =========================
@@ -276,12 +264,12 @@ def main():
     last_status = None
     last_debug_time = 0.0
     caught_robot_id = None
-    steering_sign = STEERING_SIGN
-    last_turn_check_time = 0.0
-    last_turn_error = None
-    last_target_id = None
-    last_my_position = None
     motion_heading = None
+    last_position = None
+    bootstrap_start_position = None
+    steering_sign = STEERING_SIGN
+    last_progress_time = 0.0
+    last_progress_distance = None
 
     def status(text):
         nonlocal last_status
@@ -310,20 +298,6 @@ def main():
                 time.sleep(LOOP_PERIOD_S)
                 continue
 
-            if last_my_position is not None:
-                dx = my_state["x"] - last_my_position[0]
-                dy = my_state["y"] - last_my_position[1]
-                moved = math.hypot(dx, dy)
-                if moved >= MOTION_HEADING_MIN_STEP_M:
-                    motion_heading = math.degrees(math.atan2(dy, dx)) % 360.0
-            last_my_position = (my_state["x"], my_state["y"])
-
-            control_state = dict(my_state)
-            heading_source = "mqtt"
-            if USE_MOTION_HEADING and motion_heading is not None:
-                control_state["angle"] = motion_heading
-                heading_source = "motion"
-
             if too_close_to_edge(my_state):
                 stop_motors()
                 status(
@@ -332,6 +306,14 @@ def main():
                 )
                 time.sleep(LOOP_PERIOD_S)
                 continue
+
+            if last_position is not None:
+                dx = my_state["x"] - last_position[0]
+                dy = my_state["y"] - last_position[1]
+                moved = math.hypot(dx, dy)
+                if moved >= HEADING_MIN_STEP_M:
+                    motion_heading = math.degrees(math.atan2(dy, dx)) % 360.0
+            last_position = (my_state["x"], my_state["y"])
 
             target_id, target_state, distance_m = find_closest_robot(
                 my_state,
@@ -342,11 +324,6 @@ def main():
                 status("Stopping: no other robot found")
                 time.sleep(LOOP_PERIOD_S)
                 continue
-
-            if target_id != last_target_id:
-                last_target_id = target_id
-                last_turn_error = None
-                last_turn_check_time = now
 
             if distance_m <= CATCH_DISTANCE_M:
                 stop_motors()
@@ -360,32 +337,58 @@ def main():
             if caught_robot_id == target_id and distance_m > CATCH_RELEASE_DISTANCE_M:
                 caught_robot_id = None
 
-            target_angle, diff, speed, left_speed, right_speed = drive_toward_target(
-                control_state,
+            if motion_heading is None:
+                if bootstrap_start_position is None:
+                    bootstrap_start_position = (my_state["x"], my_state["y"])
+
+                moved_from_start = math.hypot(
+                    my_state["x"] - bootstrap_start_position[0],
+                    my_state["y"] - bootstrap_start_position[1],
+                )
+                if moved_from_start < BOOTSTRAP_MOVE_M:
+                    left, right = drive_straight(BOOTSTRAP_SPEED)
+                    status("Calibrating motion heading: driving straight")
+                    if now - last_debug_time >= 0.5:
+                        print(
+                            f"bootstrap moved={moved_from_start:.3f}m "
+                            f"motors=({left},{right})"
+                        )
+                        last_debug_time = now
+                    time.sleep(LOOP_PERIOD_S)
+                    continue
+                motion_heading = math.degrees(
+                    math.atan2(
+                        my_state["y"] - bootstrap_start_position[1],
+                        my_state["x"] - bootstrap_start_position[0],
+                    )
+                ) % 360.0
+
+            target_angle, diff, speed, left_speed, right_speed = drive_toward_heading(
+                motion_heading,
                 target_state,
-                distance_m,
+                my_state,
                 steering_sign,
             )
             status(f"Chasing robot {target_id}")
 
-            abs_diff = abs(diff)
-            if abs_diff > SHARP_TURN_DEG and now - last_turn_check_time >= 1.0:
-                if last_turn_error is not None and abs_diff > last_turn_error + 12.0:
+            if now - last_progress_time >= 1.0:
+                if (
+                    last_progress_distance is not None
+                    and distance_m > last_progress_distance + 0.03
+                    and abs(diff) > STRAIGHT_TOLERANCE_DEG
+                ):
                     steering_sign *= -1
-                    print(f"Steering direction changed to {steering_sign}")
-                    last_turn_error = None
-                else:
-                    last_turn_error = abs_diff
-                last_turn_check_time = now
+                    print(f"Steering direction flipped to {steering_sign}")
+                last_progress_distance = distance_m
+                last_progress_time = now
 
             if now - last_debug_time >= 0.5:
                 print(
                     f"target={target_id} dist={distance_m:.3f}m "
-                    f"heading={control_state['angle']:.1f}deg/{heading_source} "
+                    f"heading={motion_heading:.1f}deg "
                     f"target_angle={target_angle:.1f}deg "
                     f"diff={diff:.1f}deg speed={speed} "
-                    f"motors=({left_speed},{right_speed}) "
-                    f"steering_sign={steering_sign}"
+                    f"motors=({left_speed},{right_speed})"
                 )
                 last_debug_time = now
 
