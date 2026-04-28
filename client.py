@@ -16,7 +16,7 @@ Y_MAX = 1.0
 SAFE_MARGIN = 0.20     # gewünschter Abstand zum Rand
 HARD_MARGIN = 0.05     # Notfallzone
 
-BASE_SPEED = 350
+BASE_SPEED = 1000
 STEER_GAIN = 2.0
 MAX_CORRECTION = 100
 
@@ -70,8 +70,20 @@ pipuck = PiPuck(epuck_version=2)
 def stop():
     pipuck.epuck.set_motor_speeds(0, 0)
 
-def drive_heading(current_angle, target_angle):
+def drive_heading(current_angle, target_angle, safety=False):
     diff = angle_diff(target_angle, current_angle)
+
+    if safety:
+        # Im Notfall: fast auf der Stelle ins Feld drehen
+        if diff > 0:
+            left = -250
+            right = 450
+        else:
+            left = 450
+            right = -250
+
+        pipuck.epuck.set_motor_speeds(left, right)
+        return diff, left, right
 
     correction = STEERING_SIGN * STEER_GAIN * diff
     correction = max(-MAX_CORRECTION, min(MAX_CORRECTION, correction))
@@ -79,12 +91,11 @@ def drive_heading(current_angle, target_angle):
     left = int(BASE_SPEED - correction)
     right = int(BASE_SPEED + correction)
 
-    # 🔴 NIE Rückwärts → verhindert Kreis-Spin
-    left = max(200, left)
-    right = max(200, right)
+    # Normalmodus: beide Räder vorwärts
+    left = max(180, left)
+    right = max(180, right)
 
     pipuck.epuck.set_motor_speeds(left, right)
-
     return diff, left, right
 
 
@@ -192,7 +203,7 @@ try:
             elif mode == "FOLLOW_WALL":
                 current_wall, target = wall_follow_target(current_wall, x, y)
 
-        diff, left, right = drive_heading(angle, target)
+        diff, left, right = drive_heading(angle, target, safety=(mode == "SAFETY"))
 
         print(
             f"mode={mode} | x={x:.2f}, y={y:.2f}, "
