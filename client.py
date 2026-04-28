@@ -11,18 +11,18 @@ BROKER = "192.168.178.43"
 PORT = 1883
 MY_ID = 39  
 
-# Distanzen (in Metern, falls das Tracking in Metern ist)
-RAM_DISTANCE = 0.35        # Ab 35cm wird der "Charge" (Tempo 1000) ausgelöst
-STOP_DISTANCE = 0.10       # Wenn Ziel erreicht
+# Distanzen
+RAM_DISTANCE = 0.40        # Ab 40cm wird die Flugbahn "eingeloggt"
+STOP_DISTANCE = 0.12       # Einschlag-Distanz
 
 # Geschwindigkeiten
-SPEED_APPROACH = 400       # Ruhiges Heranfahren
-SPEED_CHARGE = 1000        # Maximaler Ramm-Speed
+SPEED_CHARGE = 1000        
+SPEED_APPROACH = 500
 SPEED_BACKOFF = -400
 
-# Toleranzen
-TURN_PRECISION = 5         # Grad-Toleranz im Stand
-STEER_GAIN = 4.0           # Wie stark er während der Fahrt korrigiert
+# Toleranzen (Trigonometrie)
+AIM_THRESHOLD = 2.5        # Nur wenn Abweichung > 2.5°, wird nachjustiert
+P_TURN = 6.0               # Proportionalitätsfaktor für sanftes Drehen
 
 robot_positions = {}
 mode = "SELECT_TARGET"
@@ -32,20 +32,20 @@ current_target_id = None
 action_start_time = None
 
 # =========================
-# GEOMETRY HELPERS
+# TRIGONOMETRY HELPERS
 # =========================
 
-def get_dist_and_angle(source, target):
-    dx = target["x"] - source["x"]
-    dy = target["y"] - source["y"]
+def get_target_data(my_pos, tar_pos):
+    dx = tar_pos["x"] - my_pos["x"]
+    dy = tar_pos["y"] - my_pos["y"]
     dist = math.sqrt(dx**2 + dy**2)
-    # Winkel berechnen (0° ist +x)
+    # Atan2 liefert den exakten Winkel zum Ziel
     target_angle = math.degrees(math.atan2(dy, dx)) % 360
     return dist, target_angle
 
 def get_angle_diff(target, current):
-    diff = (target - current + 180) % 360 - 180
-    return diff
+    # Berechnet den kürzesten Weg zum Zielwinkel (-180 bis 180)
+    return (target - current + 180) % 360 - 180
 
 # =========================
 # CONTROL
@@ -88,15 +88,14 @@ try:
     while True:
         my = get_state(MY_ID)
         if not my:
-            time.sleep(0.1)
+            time.sleep(0.05)
             continue
 
         if mode == "SELECT_TARGET":
-            # Alle IDs außer der eigenen holen
             target_ids = sorted([int(rid) for rid in robot_positions.keys() if int(rid) != MY_ID])
             if target_ids:
                 current_target_id = target_ids[target_index % len(target_ids)]
-                print(f"--- Ziel erfasst: ID {current_target_id} ---")
+                print(f"Visier fixiert auf ID: {current_target_id}")
                 mode = "AIM"
             else:
                 stop()
@@ -104,58 +103,62 @@ try:
         elif mode == "AIM":
             tar = get_state(current_target_id)
             if not tar: 
-                mode = "SELECT_TARGET"
-                continue
+                mode = "SELECT_TARGET"; continue
             
-            _, target_angle = get_dist_and_angle(my, tar)
+            _, target_angle = get_target_data(my, tar)
             diff = get_angle_diff(target_angle, my["angle"])
             
-            if abs(diff) < TURN_PRECISION:
+            if abs(diff) < AIM_THRESHOLD:
                 stop()
-                print("Lock-on bestätigt. Fahre an.")
+                print("Winkel geloggt. Starte Angriff.")
                 mode = "APPROACH"
             else:
-                # Auf der Stelle drehen
-                speed = 350 if diff > 0 else -350
-                set_motors(speed, -speed)
+                # Proportionales Drehen: Je kleiner diff, desto langsamer die Motoren
+                # Das verhindert das Hin-und-Her-Zappeln (Oszillation)
+                turn_speed = diff * P_TURN
+                # Mindestgeschwindigkeit, damit er nicht verhungert
+                min_speed = 150 if diff > 0 else -150
+                final_turn = turn_speed + min_speed
+                set_motors(final_turn, -final_turn)
 
         elif mode == "APPROACH":
             tar = get_state(current_target_id)
             if not tar:
-                mode = "SELECT_TARGET"
-                continue
+                mode = "SELECT_TARGET"; continue
                 
-            dist, target_angle = get_dist_and_angle(my, tar)
+            dist, target_angle = get_target_data(my, tar)
             diff = get_angle_diff(target_angle, my["angle"])
             
+            # Wenn wir nah genug sind: Volles Rohr ohne Rücksicht auf Verluste
             if dist < RAM_DISTANCE:
-                print("!!! CHARGE !!!")
                 mode = "CHARGE"
                 continue
             
-            # Sanfte Korrektur während der Fahrt (kein Stoppen!)
-            correction = diff * STEER_GAIN
+            # Falls wir uns während der Fahrt komplett verrennen (> 30° Abweichung)
+            if abs(diff) > 30:
+                mode = "AIM"
+                continue
+
+            # Während der Fahrt nur sanft korrigieren
+            correction = diff * 3.0
             set_motors(SPEED_APPROACH - correction, SPEED_APPROACH + correction)
 
         elif mode == "CHARGE":
-            # Im Charge-Modus ignorieren wir feine Kursänderungen fast komplett
-            # Wir fahren einfach mit Gewalt auf die letzte Position
+            # Hier wird nicht mehr gelenkt. Wir vertrauen auf die Trigonometrie der Anfahrt.
+            # Voller Speed auf beiden Motoren für maximale Wucht.
+            set_motors(SPEED_CHARGE, SPEED_CHARGE)
+            
             tar = get_state(current_target_id)
-            if not tar:
-                dist = 0 # Falls Target weg, brechen wir ab
-            else:
-                dist, _ = get_dist_and_angle(my, tar)
+            dist = distance = 0
+            if tar:
+                dist, _ = get_target_data(my, tar)
 
             if dist < STOP_DISTANCE:
-                print("Einschlag!")
+                print("TREFFER!")
                 action_start_time = time.time()
                 mode = "IMPACT_HOLD"
-            else:
-                # Volles Rohr
-                set_motors(SPEED_CHARGE, SPEED_CHARGE)
 
         elif mode == "IMPACT_HOLD":
-            # Kurz gegen den Gegner drücken, um Treffer sicherzustellen
             set_motors(SPEED_CHARGE, SPEED_CHARGE)
             if time.time() - action_start_time > 0.3:
                 action_start_time = time.time()
@@ -165,7 +168,7 @@ try:
             set_motors(SPEED_BACKOFF, SPEED_BACKOFF)
             if time.time() - action_start_time > 0.6:
                 stop()
-                target_index += 1 # Nächster Roboter in der Liste
+                target_index += 1
                 mode = "SELECT_TARGET"
 
         time.sleep(0.02)
