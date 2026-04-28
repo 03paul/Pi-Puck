@@ -6,19 +6,19 @@ from pipuck.pipuck import PiPuck
 BROKER = "192.168.178.43"
 PORT = 1883
 
-MY_ID = 39
+MY_ID = 38  # anpassen
 
 X_MIN = 0.0
 X_MAX = 2.0
 Y_MIN = 0.0
 Y_MAX = 1.0
 
-SAFE_MARGIN = 0.20     # gewünschter Abstand zum Rand
-HARD_MARGIN = 0.05     # Notfallzone
+SAFE_MARGIN = 0.25
+HARD_MARGIN = 0.12
 
-BASE_SPEED = 1000
-STEER_GAIN = 2.0
-MAX_CORRECTION = 100
+BASE_SPEED = 850
+STEER_GAIN = 2.5
+MAX_CORRECTION = 120
 
 STEERING_SIGN = 1
 
@@ -29,24 +29,26 @@ start_angle = None
 current_wall = None
 
 
-# ================= MQTT =================
+def clamp_speed(v):
+    return max(-1024, min(1024, int(v)))
+
 
 def on_connect(client, userdata, flags, rc):
     print("Connected:", rc)
     client.subscribe("robot_pos/all")
 
+
 def on_message(client, userdata, msg):
     global robot_positions
     try:
         robot_positions = json.loads(msg.payload.decode())
-    except:
-        pass
+    except json.JSONDecodeError:
+        print("Invalid JSON")
 
-
-# ================= HELPERS =================
 
 def angle_diff(target, current):
     return (target - current + 180) % 360 - 180
+
 
 def get_my_state():
     rid = str(MY_ID)
@@ -63,24 +65,26 @@ def get_my_state():
     }
 
 
-# ================= ROBOT =================
-
 pipuck = PiPuck(epuck_version=2)
+
 
 def stop():
     pipuck.epuck.set_motor_speeds(0, 0)
+
 
 def drive_heading(current_angle, target_angle, safety=False):
     diff = angle_diff(target_angle, current_angle)
 
     if safety:
-        # Im Notfall: fast auf der Stelle ins Feld drehen
         if diff > 0:
-            left = -250
-            right = 450
+            left = -350
+            right = 650
         else:
-            left = 450
-            right = -250
+            left = 650
+            right = -350
+
+        left = clamp_speed(left)
+        right = clamp_speed(right)
 
         pipuck.epuck.set_motor_speeds(left, right)
         return diff, left, right
@@ -88,32 +92,28 @@ def drive_heading(current_angle, target_angle, safety=False):
     correction = STEERING_SIGN * STEER_GAIN * diff
     correction = max(-MAX_CORRECTION, min(MAX_CORRECTION, correction))
 
-    left = int(BASE_SPEED - correction)
-    right = int(BASE_SPEED + correction)
+    left = BASE_SPEED - correction
+    right = BASE_SPEED + correction
 
-    # Normalmodus: beide Räder vorwärts
-    left = max(180, left)
-    right = max(180, right)
+    left = clamp_speed(left)
+    right = clamp_speed(right)
 
     pipuck.epuck.set_motor_speeds(left, right)
     return diff, left, right
 
 
-# ================= SAFETY =================
-
 def safety_override(x, y):
-    """
-    Wenn zu nah am Rand → sofort ins Feld zurücklenken
-    """
-
     if x < X_MIN + HARD_MARGIN:
-        return 0      # nach rechts
+        return 0
+
     if x > X_MAX - HARD_MARGIN:
-        return 180    # nach links
+        return 180
+
     if y < Y_MIN + HARD_MARGIN:
-        return 90     # nach oben
+        return 90
+
     if y > Y_MAX - HARD_MARGIN:
-        return 270    # nach unten
+        return 270
 
     return None
 
@@ -121,19 +121,25 @@ def safety_override(x, y):
 def detect_wall(x, y):
     if x <= X_MIN + SAFE_MARGIN:
         return "left"
+
     if x >= X_MAX - SAFE_MARGIN:
         return "right"
+
     if y <= Y_MIN + SAFE_MARGIN:
         return "bottom"
+
     if y >= Y_MAX - SAFE_MARGIN:
         return "top"
+
     return None
 
 
 def wall_follow_target(wall, x, y):
-    """
-    Uhrzeigersinn entlang Rand
-    """
+    # Uhrzeigersinn
+    # bottom -> right
+    # right  -> up
+    # top    -> left
+    # left   -> down
 
     if wall == "bottom":
         if x >= X_MAX - SAFE_MARGIN:
@@ -158,8 +164,6 @@ def wall_follow_target(wall, x, y):
     return wall, 0
 
 
-# ================= MAIN =================
-
 client = mqtt.Client()
 client.on_connect = on_connect
 client.on_message = on_message
@@ -172,6 +176,7 @@ try:
         state = get_my_state()
 
         if state is None:
+            print("No position yet. IDs:", list(robot_positions.keys()))
             stop()
             time.sleep(0.2)
             continue
@@ -180,18 +185,22 @@ try:
         y = state["y"]
         angle = state["angle"]
 
-        # 🔴 HARD SAFETY FIRST
         safety_target = safety_override(x, y)
 
         if safety_target is not None:
-            target = safety_target
             mode = "SAFETY"
+            target = safety_target
 
         else:
             if start_angle is None:
                 start_angle = angle
+                print("Start angle:", start_angle)
 
             wall = detect_wall(x, y)
+
+            if mode == "SAFETY":
+                mode = "FOLLOW_WALL"
+                current_wall = wall if wall is not None else current_wall
 
             if mode == "GO_STRAIGHT":
                 target = start_angle
@@ -199,14 +208,23 @@ try:
                 if wall is not None:
                     mode = "FOLLOW_WALL"
                     current_wall = wall
+                    print("Hit virtual wall:", current_wall)
 
             elif mode == "FOLLOW_WALL":
+                if current_wall is None:
+                    current_wall = wall
+
                 current_wall, target = wall_follow_target(current_wall, x, y)
 
-        diff, left, right = drive_heading(angle, target, safety=(mode == "SAFETY"))
+        diff, left, right = drive_heading(
+            angle,
+            target,
+            safety=(mode == "SAFETY")
+        )
 
         print(
-            f"mode={mode} | x={x:.2f}, y={y:.2f}, "
+            f"mode={mode} | wall={current_wall} | "
+            f"x={x:.2f}, y={y:.2f}, angle={angle:.1f}, "
             f"target={target:.1f}, diff={diff:.1f}, "
             f"L={left}, R={right}"
         )
