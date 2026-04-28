@@ -15,6 +15,7 @@ Y_MAX = 1.0
 
 SAFE_MARGIN = 0.20     # gewünschter Abstand zum Rand
 HARD_MARGIN = 0.05     # Notfallzone
+OBSTACLE_AVOIDANCE_MARGIN = 0.30
 
 BASE_SPEED = 350
 STEER_GAIN = 2.0
@@ -61,6 +62,17 @@ def get_my_state():
         "y": data["position"][1],
         "angle": data["angle"]
     }
+
+def get_closest_obstacle(my_x, my_y):
+    closest_dist = float('inf')
+    for rid, data in robot_positions.items():
+        if rid == str(MY_ID): continue
+        x = data["position"][0]
+        y = data["position"][1]
+        dist = ((x - my_x)**2 + (y - my_y)**2)**0.5
+        if dist < closest_dist:
+            closest_dist = dist
+    return closest_dist
 
 
 # ================= ROBOT =================
@@ -121,28 +133,46 @@ def detect_wall(x, y):
 
 def wall_follow_target(wall, x, y):
     """
-    Uhrzeigersinn entlang Rand
+    Uhrzeigersinn entlang Rand.
+    Proportional-Regler (PD) hält den Roboter auf exakt SAFE_MARGIN Abstand.
     """
+    STEER_P = 150  # Korrektur-Winkel pro 1m Abweichung
 
     if wall == "bottom":
+        # Fahrtrichtung: 0 (Rechts), Wunschlinie: y = Y_MIN + SAFE_MARGIN
+        error = (Y_MIN + SAFE_MARGIN) - y
+        error = max(-0.5, min(0.5, error))
+        target = (0 + error * STEER_P) % 360
         if x >= X_MAX - SAFE_MARGIN:
             return "right", 90
-        return "bottom", 0
+        return "bottom", target
 
     if wall == "right":
+        # Fahrtrichtung: 90 (Oben), Wunschlinie: x = X_MAX - SAFE_MARGIN
+        error = x - (X_MAX - SAFE_MARGIN)
+        error = max(-0.5, min(0.5, error))
+        target = (90 + error * STEER_P) % 360
         if y >= Y_MAX - SAFE_MARGIN:
             return "top", 180
-        return "right", 90
+        return "right", target
 
     if wall == "top":
+        # Fahrtrichtung: 180 (Links), Wunschlinie: y = Y_MAX - SAFE_MARGIN
+        error = y - (Y_MAX - SAFE_MARGIN)
+        error = max(-0.5, min(0.5, error))
+        target = (180 + error * STEER_P) % 360
         if x <= X_MIN + SAFE_MARGIN:
             return "left", 270
-        return "top", 180
+        return "top", target
 
     if wall == "left":
+        # Fahrtrichtung: 270 (Unten), Wunschlinie: x = X_MIN + SAFE_MARGIN
+        error = (X_MIN + SAFE_MARGIN) - x
+        error = max(-0.5, min(0.5, error))
+        target = (270 + error * STEER_P) % 360
         if y <= Y_MIN + SAFE_MARGIN:
             return "bottom", 0
-        return "left", 270
+        return "left", target
 
     return wall, 0
 
@@ -171,12 +201,20 @@ try:
 
         # 🔴 HARD SAFETY FIRST
         safety_target = safety_override(x, y)
+        closest_obstacle_dist = get_closest_obstacle(x, y)
 
-        if safety_target is not None:
+        if closest_obstacle_dist < OBSTACLE_AVOIDANCE_MARGIN:
+            target = (angle + 180) % 360  # Wende um 180 Grad
+            mode = "OBSTACLE_AVOIDANCE"
+        elif safety_target is not None:
             target = safety_target
             mode = "SAFETY"
 
         else:
+            # Falls wir gerade aus einer Notfallzone kommen, gehe zurück in den Normalzustand
+            if mode in ["SAFETY", "OBSTACLE_AVOIDANCE"]:
+                mode = "FOLLOW_WALL" if current_wall else "GO_STRAIGHT"
+
             if start_angle is None:
                 start_angle = angle
 
@@ -189,7 +227,7 @@ try:
                     mode = "FOLLOW_WALL"
                     current_wall = wall
 
-            elif mode == "FOLLOW_WALL":
+            if mode == "FOLLOW_WALL":
                 current_wall, target = wall_follow_target(current_wall, x, y)
 
         diff, left, right = drive_heading(angle, target)
