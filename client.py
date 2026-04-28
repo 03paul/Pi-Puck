@@ -6,7 +6,7 @@ from pipuck.pipuck import PiPuck
 BROKER = "192.168.178.43"
 PORT = 1883
 
-MY_ID = 39  # anpassen
+MY_ID = 38  # anpassen
 
 X_MIN = 0.0
 X_MAX = 2.0
@@ -20,11 +20,13 @@ TURN_LEFT_SPEED = -500
 TURN_RIGHT_SPEED = 500
 
 ANGLE_TOLERANCE = 12
+ESCAPE_DURATION = 2.0
 
 robot_positions = {}
 
 mode = "GO_STRAIGHT"
 target_angle = None
+escape_start_time = None
 
 
 def clamp_speed(v):
@@ -85,8 +87,7 @@ def turn_towards(current_angle, desired_angle):
         stop()
         return True, diff
 
-    # Vorzeichen bei deinem Roboter offenbar invertiert:
-    # diff > 0 => mit rechter Rückwärtsbewegung drehen
+    # Falls Drehrichtung falsch: diesen Block unten invertieren
     if diff > 0:
         left = TURN_RIGHT_SPEED
         right = TURN_LEFT_SPEED
@@ -158,9 +159,24 @@ try:
             )
 
             if done:
-                print("180 turn done. Driving forward.")
+                print("180 turn done. Escaping for 2 seconds.")
+                escape_start_time = time.time()
+                mode = "ESCAPE_FORWARD"
+
+        elif mode == "ESCAPE_FORWARD":
+            drive_forward()
+
+            elapsed = time.time() - escape_start_time
+
+            print(
+                f"mode={mode} | escaping... {elapsed:.1f}/{ESCAPE_DURATION:.1f}s | "
+                f"x={x:.2f}, y={y:.2f}, angle={angle:.1f}"
+            )
+
+            if elapsed >= ESCAPE_DURATION:
+                print("Escape done. Checking walls again.")
                 mode = "GO_STRAIGHT"
-                time.sleep(0.2)
+                escape_start_time = None
 
         time.sleep(0.1)
 
