@@ -176,4 +176,6 @@ try:
 except KeyboardInterrupt:
     stop()
 finally:
+    stop()
     client.loop_stop()
+    client.disconnect()
