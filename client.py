@@ -7,110 +7,66 @@ from pipuck.pipuck import PiPuck
 # =========================
 # CONFIG
 # =========================
-
 BROKER = "192.168.178.43"
 PORT = 1883
 MY_ID = 39  
 
-# Distanz-Parameter
-TAP_DISTANCE = 0.12
-RAM_THRESHOLD = 0.30       # Etwas früher auf Rammen schalten für Stabilität
-BACKOFF_DURATION = 0.5
+# Distanzen (in Metern, falls das Tracking in Metern ist)
+RAM_DISTANCE = 0.35        # Ab 35cm wird der "Charge" (Tempo 1000) ausgelöst
+STOP_DISTANCE = 0.10       # Wenn Ziel erreicht
 
 # Geschwindigkeiten
-APPROACH_SPEED = 300       
-RAM_SPEED = 1000           
-BACKOFF_SPEED = -400
+SPEED_APPROACH = 400       # Ruhiges Heranfahren
+SPEED_CHARGE = 1000        # Maximaler Ramm-Speed
+SPEED_BACKOFF = -400
 
-TURN_SPEED = 450
-ANGLE_TOLERANCE = 3        # VIEL PRÄZISER (für gerade Linie)
-RE_TURN_THRESHOLD = 15     # Wenn Abweichung > 15°, dann stoppen und neu ausrichten
-
-STEER_GAIN = 5.0           # Aggressivere Korrektur
-MAX_CORRECTION = 250
+# Toleranzen
+TURN_PRECISION = 5         # Grad-Toleranz im Stand
+STEER_GAIN = 4.0           # Wie stark er während der Fahrt korrigiert
 
 robot_positions = {}
-mode = "WAIT_FOR_ROBOTS"
+mode = "SELECT_TARGET"
 target_ids = []
 target_index = 0
 current_target_id = None
-tap_start_time = None
-backoff_start_time = None
+action_start_time = None
 
 # =========================
-# HELPERS
+# GEOMETRY HELPERS
 # =========================
 
-def clamp_speed(v):
-    return max(-1024, min(1024, int(v)))
+def get_dist_and_angle(source, target):
+    dx = target["x"] - source["x"]
+    dy = target["y"] - source["y"]
+    dist = math.sqrt(dx**2 + dy**2)
+    # Winkel berechnen (0° ist +x)
+    target_angle = math.degrees(math.atan2(dy, dx)) % 360
+    return dist, target_angle
 
-def normalize_angle(a):
-    return a % 360
-
-def angle_diff(target, current):
-    return (target - current + 180) % 360 - 180
-
-def distance(x1, y1, x2, y2):
-    return math.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2)
-
-def angle_to_target(x, y, tx, ty):
-    return normalize_angle(math.degrees(math.atan2(ty - y, tx - x)))
+def get_angle_diff(target, current):
+    diff = (target - current + 180) % 360 - 180
+    return diff
 
 # =========================
-# MQTT & STATE
+# CONTROL
 # =========================
+pipuck = PiPuck(epuck_version=2)
 
+def set_motors(l, r):
+    pipuck.epuck.set_motor_speeds(int(max(-1024, min(1024, l))), 
+                                  int(max(-1024, min(1024, r))))
+
+def stop():
+    set_motors(0, 0)
+
+# =========================
+# MQTT
+# =========================
 def on_message(client, userdata, msg):
     global robot_positions
     try:
         robot_positions = json.loads(msg.payload.decode())
     except: pass
-
-def get_robot_state(robot_id):
-    rid = str(robot_id)
-    if rid not in robot_positions: return None
-    d = robot_positions[rid]
-    return {"x": d["position"][0], "y": d["position"][1], "angle": d["angle"]}
-
-def get_visible_target_ids():
-    return sorted([int(rid) for rid in robot_positions.keys() if int(rid) != MY_ID])
-
-# =========================
-# CONTROL
-# =========================
-
-pipuck = PiPuck(epuck_version=2)
-
-def stop():
-    pipuck.epuck.set_motor_speeds(0, 0)
-
-def drive_straight(speed, current_angle, target_angle):
-    diff = angle_diff(target_angle, current_angle)
-    
-    # Wenn wir zu weit abweichen, Modus wechseln zum neu Ausrichten
-    if abs(diff) > RE_TURN_THRESHOLD:
-        return False 
-
-    correction = diff * STEER_GAIN
-    left = speed - correction
-    right = speed + correction
-    pipuck.epuck.set_motor_speeds(clamp_speed(left), clamp_speed(right))
-    return True
-
-def turn_towards(current_angle, target_angle):
-    diff = angle_diff(target_angle, current_angle)
-    if abs(diff) <= ANGLE_TOLERANCE:
-        stop()
-        return True
-    
-    # Drehen auf der Stelle
-    speed = TURN_SPEED if diff > 0 else -TURN_SPEED
-    pipuck.epuck.set_motor_speeds(clamp_speed(speed), clamp_speed(-speed))
-    return False
-
-# =========================
-# MAIN LOGIC
-# =========================
 
 client = mqtt.Client()
 client.on_message = on_message
@@ -118,82 +74,103 @@ client.connect(BROKER, PORT, 60)
 client.subscribe("robot_pos/all")
 client.loop_start()
 
+def get_state(rid):
+    rid_s = str(rid)
+    if rid_s in robot_positions:
+        d = robot_positions[rid_s]
+        return {"x": d["position"][0], "y": d["position"][1], "angle": d["angle"]}
+    return None
+
+# =========================
+# MAIN LOOP
+# =========================
 try:
     while True:
-        my = get_robot_state(MY_ID)
+        my = get_state(MY_ID)
         if not my:
-            stop()
             time.sleep(0.1)
             continue
 
-        if mode == "WAIT_FOR_ROBOTS":
-            target_ids = get_visible_target_ids()
+        if mode == "SELECT_TARGET":
+            # Alle IDs außer der eigenen holen
+            target_ids = sorted([int(rid) for rid in robot_positions.keys() if int(rid) != MY_ID])
             if target_ids:
-                target_index = 0
-                current_target_id = target_ids[target_index]
-                mode = "TURN_TO_TARGET"
+                current_target_id = target_ids[target_index % len(target_ids)]
+                print(f"--- Ziel erfasst: ID {current_target_id} ---")
+                mode = "AIM"
             else:
                 stop()
 
-        elif mode == "TURN_TO_TARGET":
-            tar = get_robot_state(current_target_id)
-            if not tar:
-                mode = "WAIT_FOR_ROBOTS"
+        elif mode == "AIM":
+            tar = get_state(current_target_id)
+            if not tar: 
+                mode = "SELECT_TARGET"
                 continue
             
-            target_angle = angle_to_target(my["x"], my["y"], tar["x"], tar["y"])
-            if turn_towards(my["angle"], target_angle):
-                print(f"Ausgerichtet auf ID {current_target_id}. Starte Anflug.")
-                mode = "DRIVE_TO_TARGET"
-
-        elif mode == "DRIVE_TO_TARGET":
-            tar = get_robot_state(current_target_id)
-            if not tar:
-                mode = "WAIT_FOR_ROBOTS"
-                continue
-
-            d = distance(my["x"], my["y"], tar["x"], tar["y"])
-            target_angle = angle_to_target(my["x"], my["y"], tar["x"], tar["y"])
-
-            if d <= TAP_DISTANCE:
-                tap_start_time = time.time()
-                mode = "TAP"
-                continue
-
-            # Geschwindigkeit wählen
-            current_speed = RAM_SPEED if d < RAM_THRESHOLD else APPROACH_SPEED
+            _, target_angle = get_dist_and_angle(my, tar)
+            diff = get_angle_diff(target_angle, my["angle"])
             
-            # Fahren und Kurs korrigieren
-            on_track = drive_straight(current_speed, my["angle"], target_angle)
-            
-            if not on_track:
-                print("Kursabweichung zu groß! Korrigiere...")
+            if abs(diff) < TURN_PRECISION:
                 stop()
-                mode = "TURN_TO_TARGET"
+                print("Lock-on bestätigt. Fahre an.")
+                mode = "APPROACH"
+            else:
+                # Auf der Stelle drehen
+                speed = 350 if diff > 0 else -350
+                set_motors(speed, -speed)
 
-        elif mode == "TAP":
-            pipuck.epuck.set_motor_speeds(RAM_SPEED, RAM_SPEED)
-            if time.time() - tap_start_time >= 0.2:
-                backoff_start_time = time.time()
+        elif mode == "APPROACH":
+            tar = get_state(current_target_id)
+            if not tar:
+                mode = "SELECT_TARGET"
+                continue
+                
+            dist, target_angle = get_dist_and_angle(my, tar)
+            diff = get_angle_diff(target_angle, my["angle"])
+            
+            if dist < RAM_DISTANCE:
+                print("!!! CHARGE !!!")
+                mode = "CHARGE"
+                continue
+            
+            # Sanfte Korrektur während der Fahrt (kein Stoppen!)
+            correction = diff * STEER_GAIN
+            set_motors(SPEED_APPROACH - correction, SPEED_APPROACH + correction)
+
+        elif mode == "CHARGE":
+            # Im Charge-Modus ignorieren wir feine Kursänderungen fast komplett
+            # Wir fahren einfach mit Gewalt auf die letzte Position
+            tar = get_state(current_target_id)
+            if not tar:
+                dist = 0 # Falls Target weg, brechen wir ab
+            else:
+                dist, _ = get_dist_and_angle(my, tar)
+
+            if dist < STOP_DISTANCE:
+                print("Einschlag!")
+                action_start_time = time.time()
+                mode = "IMPACT_HOLD"
+            else:
+                # Volles Rohr
+                set_motors(SPEED_CHARGE, SPEED_CHARGE)
+
+        elif mode == "IMPACT_HOLD":
+            # Kurz gegen den Gegner drücken, um Treffer sicherzustellen
+            set_motors(SPEED_CHARGE, SPEED_CHARGE)
+            if time.time() - action_start_time > 0.3:
+                action_start_time = time.time()
                 mode = "BACKOFF"
 
         elif mode == "BACKOFF":
-            pipuck.epuck.set_motor_speeds(BACKOFF_SPEED, BACKOFF_SPEED)
-            if time.time() - backoff_start_time >= BACKOFF_DURATION:
+            set_motors(SPEED_BACKOFF, SPEED_BACKOFF)
+            if time.time() - action_start_time > 0.6:
                 stop()
-                # Nächstes Ziel wählen
-                target_ids = get_visible_target_ids()
-                if target_ids:
-                    target_index = (target_index + 1) % len(target_ids)
-                    current_target_id = target_ids[target_index]
-                    mode = "TURN_TO_TARGET"
-                else:
-                    mode = "WAIT_FOR_ROBOTS"
+                target_index += 1 # Nächster Roboter in der Liste
+                mode = "SELECT_TARGET"
 
-        time.sleep(0.05)
+        time.sleep(0.02)
 
 except KeyboardInterrupt:
-    pass
-finally:
     stop()
+finally:
     client.loop_stop()
