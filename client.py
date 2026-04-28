@@ -6,7 +6,7 @@ from pipuck.pipuck import PiPuck
 BROKER = "192.168.178.43"
 PORT = 1883
 
-MY_ID = 38
+MY_ID = 39
 
 X_MIN = 0.0
 X_MAX = 2.0
