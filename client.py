@@ -6,45 +6,51 @@ from pipuck.pipuck import PiPuck
 BROKER = "192.168.178.43"
 PORT = 1883
 
-MY_ID = 39
+MY_ID = 39  # anpassen
 
 X_MIN = 0.0
 X_MAX = 2.0
 Y_MIN = 0.0
 Y_MAX = 1.0
 
-MARGIN = 0.20
+SAFE_MARGIN = 0.20
 
-BASE_SPEED = 600
-TURN_SPEED = 600
+FORWARD_SPEED = 650
+TURN_LEFT_SPEED = -500
+TURN_RIGHT_SPEED = 500
+
+ANGLE_TOLERANCE = 12
 
 robot_positions = {}
 
-mode = "FORWARD"
+mode = "GO_STRAIGHT"
 target_angle = None
 
 
-# ================= MQTT =================
+def clamp_speed(v):
+    return max(-1024, min(1024, int(v)))
+
 
 def on_connect(client, userdata, flags, rc):
     print("Connected:", rc)
     client.subscribe("robot_pos/all")
 
+
 def on_message(client, userdata, msg):
     global robot_positions
     try:
         robot_positions = json.loads(msg.payload.decode())
-    except:
-        pass
+    except json.JSONDecodeError:
+        print("Invalid JSON")
 
-
-# ================= HELPERS =================
 
 def angle_diff(target, current):
     return (target - current + 180) % 360 - 180
 
-def normalize_angle(a):
-    return a % 360
+
+def normalize_angle(angle):
+    return angle % 360
+
 
 def get_my_state():
     rid = str(MY_ID)
@@ -61,38 +67,49 @@ def get_my_state():
     }
 
 
-# ================= ROBOT =================
-
 pipuck = PiPuck(epuck_version=2)
+
 
 def stop():
     pipuck.epuck.set_motor_speeds(0, 0)
 
-def forward():
-    pipuck.epuck.set_motor_speeds(BASE_SPEED, BASE_SPEED)
 
-def turn_left():
-    pipuck.epuck.set_motor_speeds(-TURN_SPEED, TURN_SPEED)
-
-def turn_right():
-    pipuck.epuck.set_motor_speeds(TURN_SPEED, -TURN_SPEED)
+def drive_forward():
+    pipuck.epuck.set_motor_speeds(FORWARD_SPEED, FORWARD_SPEED)
 
 
-# ================= WALL DETECTION =================
+def turn_towards(current_angle, desired_angle):
+    diff = angle_diff(desired_angle, current_angle)
 
-def hit_wall(x, y):
-    if x <= X_MIN + MARGIN:
-        return True
-    if x >= X_MAX - MARGIN:
-        return True
-    if y <= Y_MIN + MARGIN:
-        return True
-    if y >= Y_MAX - MARGIN:
-        return True
-    return False
+    if abs(diff) <= ANGLE_TOLERANCE:
+        stop()
+        return True, diff
+
+    # Vorzeichen bei deinem Roboter offenbar invertiert:
+    # diff > 0 => mit rechter Rückwärtsbewegung drehen
+    if diff > 0:
+        left = TURN_RIGHT_SPEED
+        right = TURN_LEFT_SPEED
+    else:
+        left = TURN_LEFT_SPEED
+        right = TURN_RIGHT_SPEED
+
+    pipuck.epuck.set_motor_speeds(
+        clamp_speed(left),
+        clamp_speed(right)
+    )
+
+    return False, diff
 
 
-# ================= MAIN =================
+def near_wall(x, y):
+    return (
+        x <= X_MIN + SAFE_MARGIN or
+        x >= X_MAX - SAFE_MARGIN or
+        y <= Y_MIN + SAFE_MARGIN or
+        y >= Y_MAX - SAFE_MARGIN
+    )
+
 
 client = mqtt.Client()
 client.on_connect = on_connect
@@ -106,6 +123,7 @@ try:
         state = get_my_state()
 
         if state is None:
+            print("No position yet. IDs:", list(robot_positions.keys()))
             stop()
             time.sleep(0.2)
             continue
@@ -114,35 +132,37 @@ try:
         y = state["y"]
         angle = state["angle"]
 
-        # ================= FORWARD =================
-        if mode == "FORWARD":
-
-            if hit_wall(x, y):
-                print("🔥 HIT WALL → BOUNCE")
+        if mode == "GO_STRAIGHT":
+            if near_wall(x, y):
+                stop()
+                time.sleep(0.2)
 
                 target_angle = normalize_angle(angle + 180)
-                mode = "TURN"
+                mode = "TURN_180"
 
+                print(f"Wall reached. Turning from {angle:.1f} to {target_angle:.1f}")
             else:
-                forward()
+                drive_forward()
 
-        # ================= TURN =================
-        elif mode == "TURN":
+            print(
+                f"mode={mode} | x={x:.2f}, y={y:.2f}, "
+                f"angle={angle:.1f}, target={target_angle}"
+            )
 
-            diff = angle_diff(target_angle, angle)
+        elif mode == "TURN_180":
+            done, diff = turn_towards(angle, target_angle)
 
-            print(f"TURNING | angle={angle:.1f} target={target_angle:.1f} diff={diff:.1f}")
+            print(
+                f"mode={mode} | x={x:.2f}, y={y:.2f}, "
+                f"angle={angle:.1f}, target={target_angle:.1f}, diff={diff:.1f}"
+            )
 
-            if abs(diff) < 10:
-                print("✅ TURN DONE")
-                mode = "FORWARD"
-            else:
-                if diff > 0:
-                    turn_left()
-                else:
-                    turn_right()
+            if done:
+                print("180 turn done. Driving forward.")
+                mode = "GO_STRAIGHT"
+                time.sleep(0.2)
 
-        time.sleep(0.05)
+        time.sleep(0.1)
 
 except KeyboardInterrupt:
     print("Stopping...")
