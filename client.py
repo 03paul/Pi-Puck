@@ -20,7 +20,6 @@ SPEED_APPROACH = 450       # Langsames Heranfahren
 SPEED_RAM = 1000           # Die versprochenen 1000
 SPEED_BACKOFF = -400
 
-<<<<<<< HEAD
 SAFE_MARGIN = 0.20     # gewünschter Abstand zum Rand
 HARD_MARGIN = 0.05     # Notfallzone
 OBSTACLE_AVOIDANCE_MARGIN = 0.30
