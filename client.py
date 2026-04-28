@@ -7,6 +7,9 @@ import paho.mqtt.client as mqtt
 from pipuck.pipuck import PiPuck
 
 
+CLIENT_VERSION = "no-circle-forward-only-v3"
+
+
 # =========================
 # CONFIG
 # =========================
@@ -33,12 +36,16 @@ MAX_SPEED = 1000
 
 # Steering behavior
 LOOP_PERIOD_S = 0.05
-TURN_IN_PLACE_DEG = 45.0
 AIM_OK_DEG = 6.0
-TURN_GAIN = 9.0
-STEER_GAIN = 7.0
-MAX_TURN_SPEED = 650
-MAX_STEER_CORRECTION = 500
+STEER_GAIN = 0.85
+SHARP_TURN_DEG = 70.0
+SHARP_TURN_SPEED = 220
+MIN_MOVING_SPEED = 120
+ANGLE_UNIT = "auto"  # "auto", "degrees", or "radians"
+ANGLE_SIGN = 1       # set to -1 if the MQTT angle grows in the wrong direction
+ANGLE_OFFSET_DEG = 0 # try 90, -90, or 180 if the tracked front is rotated
+USE_MOTION_HEADING = True
+MOTION_HEADING_MIN_STEP_M = 0.015
 
 # Set this to -1 if the robot steers away from the target instead of toward it.
 STEERING_SIGN = 1
@@ -64,6 +71,19 @@ def angle_diff_deg(target_deg, current_deg):
     return (target_deg - current_deg + 180.0) % 360.0 - 180.0
 
 
+def normalize_angle_deg(raw_angle):
+    angle = float(raw_angle)
+
+    if ANGLE_UNIT == "radians":
+        angle = math.degrees(angle)
+    if ANGLE_UNIT == "degrees":
+        angle = angle
+    elif -2.0 * math.pi <= angle <= 2.0 * math.pi:
+        angle = math.degrees(angle)
+
+    return (ANGLE_SIGN * angle + ANGLE_OFFSET_DEG) % 360.0
+
+
 def parse_robot_state(raw):
     if not isinstance(raw, dict):
         return None
@@ -77,7 +97,7 @@ def parse_robot_state(raw):
         return {
             "x": float(pos[0]),
             "y": float(pos[1]),
-            "angle": float(angle) % 360.0,
+            "angle": normalize_angle_deg(angle),
         }
     except (TypeError, ValueError):
         return None
@@ -159,32 +179,36 @@ def stop_motors():
     set_motors(0, 0)
 
 
-def drive_toward_target(my_state, target_state, distance_m):
+def drive_toward_target(my_state, target_state, distance_m, steering_sign):
     _, target_angle = distance_and_angle(my_state, target_state)
     diff = angle_diff_deg(target_angle, my_state["angle"])
-    signed_diff = STEERING_SIGN * diff
-
-    if abs(diff) > TURN_IN_PLACE_DEG:
-        turn = clamp(signed_diff * TURN_GAIN, -MAX_TURN_SPEED, MAX_TURN_SPEED)
-        if abs(turn) < 220:
-            turn = 220 if turn >= 0 else -220
-        set_motors(-turn, turn)
-        return target_angle, diff, 0
+    signed_diff = steering_sign * diff
 
     speed = speed_for_distance(distance_m)
-    if abs(diff) <= AIM_OK_DEG:
-        correction = 0
-    else:
-        correction = clamp(
-            signed_diff * STEER_GAIN,
-            -MAX_STEER_CORRECTION,
-            MAX_STEER_CORRECTION,
-        )
+    if abs(diff) > SHARP_TURN_DEG:
+        speed = min(speed, SHARP_TURN_SPEED)
 
-    left = speed - correction
-    right = speed + correction
+    if abs(diff) <= AIM_OK_DEG:
+        left = speed
+        right = speed
+    elif signed_diff > 0:
+        turn_ratio = clamp(abs(diff) / 100.0 * STEER_GAIN, 0.15, 0.80)
+        left = speed * (1.0 - turn_ratio)
+        right = speed
+    else:
+        turn_ratio = clamp(abs(diff) / 100.0 * STEER_GAIN, 0.15, 0.80)
+        left = speed
+        right = speed * (1.0 - turn_ratio)
+
+    if speed > 0:
+        left = clamp(left, MIN_MOVING_SPEED, MAX_SPEED)
+        right = clamp(right, MIN_MOVING_SPEED, MAX_SPEED)
+    else:
+        left = 0
+        right = 0
+
     set_motors(left, right)
-    return target_angle, diff, speed
+    return target_angle, diff, speed, int(left), int(right)
 
 
 # =========================
@@ -252,6 +276,12 @@ def main():
     last_status = None
     last_debug_time = 0.0
     caught_robot_id = None
+    steering_sign = STEERING_SIGN
+    last_turn_check_time = 0.0
+    last_turn_error = None
+    last_target_id = None
+    last_my_position = None
+    motion_heading = None
 
     def status(text):
         nonlocal last_status
@@ -260,7 +290,7 @@ def main():
             last_status = text
 
     try:
-        print(f"PiPuck {MY_ID} started")
+        print(f"PiPuck {MY_ID} started - {CLIENT_VERSION}")
 
         while True:
             now = time.monotonic()
@@ -279,6 +309,20 @@ def main():
                 status(f"Stopping: own robot {MY_ID} missing in MQTT data")
                 time.sleep(LOOP_PERIOD_S)
                 continue
+
+            if last_my_position is not None:
+                dx = my_state["x"] - last_my_position[0]
+                dy = my_state["y"] - last_my_position[1]
+                moved = math.hypot(dx, dy)
+                if moved >= MOTION_HEADING_MIN_STEP_M:
+                    motion_heading = math.degrees(math.atan2(dy, dx)) % 360.0
+            last_my_position = (my_state["x"], my_state["y"])
+
+            control_state = dict(my_state)
+            heading_source = "mqtt"
+            if USE_MOTION_HEADING and motion_heading is not None:
+                control_state["angle"] = motion_heading
+                heading_source = "motion"
 
             if too_close_to_edge(my_state):
                 stop_motors()
@@ -299,6 +343,11 @@ def main():
                 time.sleep(LOOP_PERIOD_S)
                 continue
 
+            if target_id != last_target_id:
+                last_target_id = target_id
+                last_turn_error = None
+                last_turn_check_time = now
+
             if distance_m <= CATCH_DISTANCE_M:
                 stop_motors()
                 if caught_robot_id != target_id:
@@ -311,19 +360,32 @@ def main():
             if caught_robot_id == target_id and distance_m > CATCH_RELEASE_DISTANCE_M:
                 caught_robot_id = None
 
-            target_angle, diff, speed = drive_toward_target(
-                my_state,
+            target_angle, diff, speed, left_speed, right_speed = drive_toward_target(
+                control_state,
                 target_state,
                 distance_m,
+                steering_sign,
             )
             status(f"Chasing robot {target_id}")
+
+            abs_diff = abs(diff)
+            if abs_diff > SHARP_TURN_DEG and now - last_turn_check_time >= 1.0:
+                if last_turn_error is not None and abs_diff > last_turn_error + 12.0:
+                    steering_sign *= -1
+                    print(f"Steering direction changed to {steering_sign}")
+                    last_turn_error = None
+                else:
+                    last_turn_error = abs_diff
+                last_turn_check_time = now
 
             if now - last_debug_time >= 0.5:
                 print(
                     f"target={target_id} dist={distance_m:.3f}m "
-                    f"my_angle={my_state['angle']:.1f}deg "
+                    f"heading={control_state['angle']:.1f}deg/{heading_source} "
                     f"target_angle={target_angle:.1f}deg "
-                    f"diff={diff:.1f}deg speed={speed}"
+                    f"diff={diff:.1f}deg speed={speed} "
+                    f"motors=({left_speed},{right_speed}) "
+                    f"steering_sign={steering_sign}"
                 )
                 last_debug_time = now
 
