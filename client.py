@@ -6,21 +6,26 @@ from pipuck.pipuck import PiPuck
 BROKER = "192.168.178.43"
 PORT = 1883
 
-MY_ID = 38  # anpassen
+MY_ID = 39  # anpassen
 
 X_MIN = 0.0
 X_MAX = 2.0
 Y_MIN = 0.0
 Y_MAX = 1.0
 
-SAFE_MARGIN = 0.20
+# Größerer Sicherheitsabstand, damit er nicht über den Rand schießt
+SAFE_MARGIN = 0.35
 
-FORWARD_SPEED = 650
+NORMAL_SPEED = 450
+ESCAPE_SPEED = 300
+
 TURN_LEFT_SPEED = -500
 TURN_RIGHT_SPEED = 500
 
 ANGLE_TOLERANCE = 12
-ESCAPE_DURATION = 2.0
+
+# Nicht 2 Sekunden, sonst fährt er bei kleinem Feld zu weit
+ESCAPE_DURATION = 0.7
 
 robot_positions = {}
 
@@ -76,8 +81,9 @@ def stop():
     pipuck.epuck.set_motor_speeds(0, 0)
 
 
-def drive_forward():
-    pipuck.epuck.set_motor_speeds(FORWARD_SPEED, FORWARD_SPEED)
+def drive_forward(speed=NORMAL_SPEED):
+    speed = clamp_speed(speed)
+    pipuck.epuck.set_motor_speeds(speed, speed)
 
 
 def turn_towards(current_angle, desired_angle):
@@ -87,7 +93,7 @@ def turn_towards(current_angle, desired_angle):
         stop()
         return True, diff
 
-    # Falls Drehrichtung falsch: diesen Block unten invertieren
+    # Falls er falsch herum dreht: diesen if/else-Block invertieren
     if diff > 0:
         left = TURN_RIGHT_SPEED
         right = TURN_LEFT_SPEED
@@ -143,7 +149,7 @@ try:
 
                 print(f"Wall reached. Turning from {angle:.1f} to {target_angle:.1f}")
             else:
-                drive_forward()
+                drive_forward(NORMAL_SPEED)
 
             print(
                 f"mode={mode} | x={x:.2f}, y={y:.2f}, "
@@ -159,12 +165,12 @@ try:
             )
 
             if done:
-                print("180 turn done. Escaping for 2 seconds.")
+                print("180 turn done. Escaping forward briefly.")
                 escape_start_time = time.time()
                 mode = "ESCAPE_FORWARD"
 
         elif mode == "ESCAPE_FORWARD":
-            drive_forward()
+            drive_forward(ESCAPE_SPEED)
 
             elapsed = time.time() - escape_start_time
 
@@ -175,6 +181,8 @@ try:
 
             if elapsed >= ESCAPE_DURATION:
                 print("Escape done. Checking walls again.")
+                stop()
+                time.sleep(0.1)
                 mode = "GO_STRAIGHT"
                 escape_start_time = None
 
