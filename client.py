@@ -29,11 +29,9 @@ STEER_GAIN = 2.0
 MAX_CORRECTION = 100
 
 STEERING_SIGN = 1
-=======
 # Präzision
 AIM_TOLERANCE = 3.5        # Grad-Toleranz (nicht zu eng, sonst zappelt er)
 MIN_TURN_SPEED = 200       # Mindestkraft zum Drehen (gegen Reibung)
->>>>>>> 3da9deb2544467e00c068279bedcf06b3c35a346
 
 robot_positions = {}
 mode = "SELECT_TARGET"
@@ -77,7 +75,6 @@ def on_message(client, userdata, msg):
     global robot_positions
     try:
         robot_positions = json.loads(msg.payload.decode())
-<<<<<<< HEAD
     except:
         pass
 
@@ -216,7 +213,6 @@ def wall_follow_target(wall, x, y):
 
 
 # ================= MAIN =================
-=======
     except: pass
 >>>>>>> 3da9deb2544467e00c068279bedcf06b3c35a346
 
@@ -255,7 +251,6 @@ try:
             else:
                 stop()
 
-<<<<<<< HEAD
         # 🔴 HARD SAFETY FIRST
         safety_target = safety_override(x, y)
         closest_obstacle_dist = get_closest_obstacle(x, y)
@@ -274,7 +269,6 @@ try:
 
             if start_angle is None:
                 start_angle = angle
-=======
         elif mode == "AIM":
             tar = get_state(current_target_id)
             if not tar: 
@@ -310,7 +304,6 @@ try:
                 print(">>> RAMMEN MIT TEMPO 1000!")
                 mode = "CHARGE"
                 continue
->>>>>>> 3da9deb2544467e00c068279bedcf06b3c35a346
 
             # Während der langsamen Fahrt Kurs halten
             # Wir lassen eine größere Toleranz (15°) zu, bevor wir abbrechen
@@ -338,16 +331,13 @@ try:
                 time.sleep(0.2)
                 mode = "BACKOFF"
 
-<<<<<<< HEAD
             if mode == "FOLLOW_WALL":
                 current_wall, target = wall_follow_target(current_wall, x, y)
-=======
         elif mode == "IMPACT_HOLD":
             set_motors(SPEED_RAM, SPEED_RAM) # Weiter drücken
             if time.time() - timer_start > 0.3:
                 timer_start = time.time()
                 mode = "BACKOFF"
->>>>>>> 3da9deb2544467e00c068279bedcf06b3c35a346
 
         elif mode == "BACKOFF":
             set_motors(SPEED_BACKOFF, SPEED_BACKOFF)
