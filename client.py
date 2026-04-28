@@ -173,8 +173,10 @@ try:
 
         time.sleep(0.02)
 
+
 except KeyboardInterrupt:
-    stop()
+    print("Stopping...")
+
 finally:
     stop()
     client.loop_stop()
