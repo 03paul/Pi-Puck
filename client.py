@@ -1,4 +1,7 @@
-import curses
+import sys
+import tty
+import termios
+import select
 import time
 from pipuck.pipuck import PiPuck
 
@@ -6,18 +9,20 @@ from pipuck.pipuck import PiPuck
 # CONFIG
 # =========================
 
-NORMAL_SPEED = 600
-BOOST_SPEED = 1000
-TURN_SPEED_NORMAL = 500
-TURN_SPEED_BOOST = 900
+NORMAL_FORWARD_SPEED = 600
+NORMAL_TURN_SPEED = 500
 
-# Wie lange ein Tastendruck "aktiv" bleibt
-KEY_TIMEOUT = 0.15
+BOOST_FORWARD_SPEED = 1000
+BOOST_TURN_SPEED = 900
 
-LOOP_DELAY = 0.03
+LOOP_DELAY = 0.05
 
 pipuck = PiPuck(epuck_version=2)
 
+
+# =========================
+# MOTOR CONTROL
+# =========================
 
 def clamp_speed(v):
     return max(-1024, min(1024, int(v)))
@@ -34,98 +39,112 @@ def stop():
     set_motors(0, 0)
 
 
-def main(stdscr):
-    curses.cbreak()
-    curses.noecho()
-    stdscr.nodelay(True)
-    stdscr.keypad(True)
+def forward(boost=False):
+    speed = BOOST_FORWARD_SPEED if boost else NORMAL_FORWARD_SPEED
+    set_motors(speed, speed)
 
-    last_move_key = None
-    last_move_time = 0
 
-    last_space_time = 0
+def backward(boost=False):
+    speed = BOOST_FORWARD_SPEED if boost else NORMAL_FORWARD_SPEED
+    set_motors(-speed, -speed)
 
-    stdscr.clear()
-    stdscr.addstr(0, 0, "Pi-Puck Manual Control")
-    stdscr.addstr(2, 0, "W = forward")
-    stdscr.addstr(3, 0, "S = backward")
-    stdscr.addstr(4, 0, "A = left")
-    stdscr.addstr(5, 0, "D = right")
-    stdscr.addstr(6, 0, "SPACE = boost while active")
-    stdscr.addstr(7, 0, "Q = quit")
-    stdscr.addstr(9, 0, "Robot moves only while key is actively repeated.")
-    stdscr.refresh()
+
+def turn_left(boost=False):
+    speed = BOOST_TURN_SPEED if boost else NORMAL_TURN_SPEED
+    set_motors(-speed, speed)
+
+
+def turn_right(boost=False):
+    speed = BOOST_TURN_SPEED if boost else NORMAL_TURN_SPEED
+    set_motors(speed, -speed)
+
+
+# =========================
+# KEYBOARD INPUT
+# =========================
+
+def key_pressed():
+    dr, _, _ = select.select([sys.stdin], [], [], 0)
+    if dr:
+        return sys.stdin.read(1)
+    return None
+
+
+# =========================
+# MAIN
+# =========================
+
+old_settings = termios.tcgetattr(sys.stdin)
+
+boost = False
+current_action = "STOP"
+
+try:
+    tty.setcbreak(sys.stdin.fileno())
+
+    print("Manual Pi-Puck control started.")
+    print("W = forward | S = backward | A = left | D = right | X = stop | SPACE = toggle boost | Q = quit")
+    print("Boost OFF")
 
     stop()
 
-    try:
-        while True:
-            now = time.time()
+    while True:
+        key = key_pressed()
 
-            key = stdscr.getch()
+        if key is not None:
+            key = key.lower()
 
-            while key != -1:
-                ch = chr(key).lower() if 0 <= key <= 255 else ""
+            if key == " ":
+                boost = not boost
+                print("Boost ON" if boost else "Boost OFF")
 
-                if ch in ["w", "a", "s", "d"]:
-                    last_move_key = ch
-                    last_move_time = now
-
-                elif ch == " ":
-                    last_space_time = now
-
-                elif ch == "q":
-                    stop()
-                    return
-
-                key = stdscr.getch()
-
-            move_active = (now - last_move_time) <= KEY_TIMEOUT
-            boost_active = (now - last_space_time) <= KEY_TIMEOUT
-
-            speed = BOOST_SPEED if boost_active else NORMAL_SPEED
-            turn_speed = TURN_SPEED_BOOST if boost_active else TURN_SPEED_NORMAL
-
-            if not move_active:
-                stop()
-                status = "STOP"
-            else:
-                if last_move_key == "w":
-                    set_motors(speed, speed)
-                    status = "FORWARD BOOST" if boost_active else "FORWARD"
-
-                elif last_move_key == "s":
-                    set_motors(-speed, -speed)
-                    status = "BACKWARD BOOST" if boost_active else "BACKWARD"
-
-                elif last_move_key == "a":
-                    set_motors(-turn_speed, turn_speed)
-                    status = "LEFT BOOST" if boost_active else "LEFT"
-
-                elif last_move_key == "d":
-                    set_motors(turn_speed, -turn_speed)
-                    status = "RIGHT BOOST" if boost_active else "RIGHT"
-
+                # aktuelle Bewegung direkt mit neuer Boost-Stufe aktualisieren
+                if current_action == "FORWARD":
+                    forward(boost)
+                elif current_action == "BACKWARD":
+                    backward(boost)
+                elif current_action == "LEFT":
+                    turn_left(boost)
+                elif current_action == "RIGHT":
+                    turn_right(boost)
                 else:
                     stop()
-                    status = "STOP"
 
-            stdscr.addstr(11, 0, " " * 60)
-            stdscr.addstr(
-                11,
-                0,
-                f"Status: {status} | speed={speed if boost_active else NORMAL_SPEED}"
-            )
-            stdscr.refresh()
+            elif key == "w":
+                current_action = "FORWARD"
+                print("Forward", "| BOOST" if boost else "")
+                forward(boost)
 
-            time.sleep(LOOP_DELAY)
+            elif key == "s":
+                current_action = "BACKWARD"
+                print("Backward", "| BOOST" if boost else "")
+                backward(boost)
 
-    finally:
-        stop()
+            elif key == "a":
+                current_action = "LEFT"
+                print("Left", "| BOOST" if boost else "")
+                turn_left(boost)
 
+            elif key == "d":
+                current_action = "RIGHT"
+                print("Right", "| BOOST" if boost else "")
+                turn_right(boost)
 
-if __name__ == "__main__":
-    try:
-        curses.wrapper(main)
-    finally:
-        stop()
+            elif key == "x":
+                current_action = "STOP"
+                print("Stop")
+                stop()
+
+            elif key == "q":
+                print("Quit")
+                break
+
+        time.sleep(LOOP_DELAY)
+
+except KeyboardInterrupt:
+    print("\nKeyboardInterrupt")
+
+finally:
+    stop()
+    termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
+    print("Robot stopped.")
