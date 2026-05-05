@@ -156,30 +156,35 @@ try:
         diff = angle_diff(target_angle, pos["angle"])
 
         # ── Ziel erreicht ──────────────────────────────────────
+# ── Ziel erreicht ──────────────────────────────────────
         if d < POS_TOL:
             stop()
             print(f"Ziel ({tx:.2f},{ty:.2f}) erreicht!")
 
             if phase == "GOTO_BORDER":
-                if is_on_border(pos):
-                    print("→ Rand erreicht, starte FOLLOW_BORDER")
-                    phase = "FOLLOW_BORDER"
-                    corner_index = min(
-                        range(len(CORNERS)),
-                        key=lambda i: math.hypot(
-                            CORNERS[i][0] - pos["x"],
-                            CORNERS[i][1] - pos["y"]
-                        )
+                # WECHSEL ERZWINGEN: Wenn wir nah genug am berechneten Randpunkt sind, 
+                # wechseln wir in den Follow-Modus.
+                print("→ Rand-Punkt erreicht, starte FOLLOW_BORDER")
+                phase = "FOLLOW_BORDER"
+                
+                # Finde die nächste Ecke, um den Rundlauf zu starten
+                corner_index = min(
+                    range(len(CORNERS)),
+                    key=lambda i: math.hypot(
+                        CORNERS[i][0] - pos["x"],
+                        CORNERS[i][1] - pos["y"]
                     )
-                # sonst: neues Zwischenziel zum Rand
+                )
             else:
+                # In der FOLLOW_BORDER Phase: Einfach zur nächsten Ecke springen
                 corner_index = (corner_index + 1) % len(CORNERS)
                 print(f"→ Nächste Ecke: {corner_index} = {CORNERS[corner_index]}")
 
+            # Neues Ziel basierend auf der neuen Phase/Ecke berechnen
             compute_target(pos)
-            state = "TURN"
+            state = "TURN" # Zuerst wieder ausrichten
             print(f"Neues Ziel: ({tx:.2f},{ty:.2f}), state=TURN")
-            time.sleep(0.1)
+            time.sleep(0.2) # Kurz warten für Stabilität
             continue
 
         # ── TURN: Ausrichten ───────────────────────────────────
