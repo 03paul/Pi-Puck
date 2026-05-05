@@ -132,13 +132,15 @@ try:
     stop()
 
     while True:
+
+        robot = get_state(MY_ID)
+        obj = get_state(TARGET_ID)
+
+
         key = key_pressed()
 
         target_angle = angle_to_target(robot, obj)
         dist = distance(robot, obj)
-
-        robot = get_state(MY_ID)
-        obj = get_state(TARGET_ID)
 
         if robot["angle"] is not None:
             diff = angle_diff(target_angle, robot["angle"])
