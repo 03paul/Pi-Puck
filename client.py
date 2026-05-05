@@ -37,7 +37,7 @@ def angle_to_target(robot, target):
     dx = target["x"] - robot["x"]
     dy = target["y"] - robot["y"]
 
-    return normalize_angle(math.degrees(math.atan2(dy, dx)) + 180)
+    return normalize_angle(math.degrees(math.atan2(dy, dx)))
 
 
 def get_state(rid):
