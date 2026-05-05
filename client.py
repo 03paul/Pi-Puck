@@ -7,7 +7,7 @@ from pipuck.pipuck import PiPuck
 # ── Konfiguration ──────────────────────────────────────────────
 BROKER = "192.168.178.43"
 PORT   = 1883
-MY_ID  = 39
+MY_ID  = 38
 
 # Spielfeld
 X_MIN, X_MAX = 0.0, 2.0
