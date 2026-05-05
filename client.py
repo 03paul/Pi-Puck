@@ -38,7 +38,7 @@ MAX_CORRECTION = 250
 # WICHTIG:
 # Falls der Roboter 180° falsch orientiert ist, auf 180 lassen.
 # Falls er komplett falsch fährt, teste 0, 90, -90, 180.
-ANGLE_OFFSET = 180.0
+ANGLE_OFFSET = 0
 
 # Falls er beim Drehen in die falsche Richtung dreht: auf -1 setzen
 TURN_SIGN = 1
@@ -223,7 +223,7 @@ def drive_to_coordinate(target_x, target_y):
             return
 
         # Wenn Winkel stark falsch: erst drehen
-        if abs(diff) > 45:
+        if abs(diff) > 120:
             done, turn_diff = turn_towards(angle, target_angle)
             print(
                 f"mode=TURN | pos=({x:.2f},{y:.2f}) "
