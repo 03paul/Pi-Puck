@@ -2,25 +2,43 @@ import paho.mqtt.client as mqtt
 import json
 import time
 import math
+from pipuck.pipuck import PiPuck
 
 BROKER = "192.168.178.43"
 PORT = 1883
 
-MY_ID = 39          # eigene Roboter-ID anpassen
+MY_ID = 38          # eigene Tracking-ID anpassen
 TARGET_ID = 44      # Objekt-ID
+
+ALIGN_TOLERANCE = 2.0
+TURN_SPEED = 150
+CHARGE_SPEED = 1000
+CHARGE_DURATION = 2.0
 
 robot_positions = {}
 
-def on_connect(client, userdata, flags, rc):
-    print("Connected:", rc)
-    client.subscribe("robot_pos/all")
+mode = "ALIGN"
+charge_start_time = None
 
-def on_message(client, userdata, msg):
-    global robot_positions
-    try:
-        robot_positions = json.loads(msg.payload.decode())
-    except json.JSONDecodeError:
-        print("Invalid JSON")
+
+def clamp_speed(v):
+    return max(-1024, min(1024, int(v)))
+
+
+def normalize_angle(angle):
+    return angle % 360
+
+
+def angle_diff(target, current):
+    return (target - current + 180) % 360 - 180
+
+
+def angle_to_target(robot, target):
+    dx = target["x"] - robot["x"]
+    dy = target["y"] - robot["y"]
+
+    return normalize_angle(math.degrees(math.atan2(dy, dx)))
+
 
 def get_state(rid):
     rid = str(rid)
@@ -30,34 +48,54 @@ def get_state(rid):
 
     data = robot_positions[rid]
 
+    if "position" not in data:
+        return None
+
     return {
         "x": data["position"][0],
         "y": data["position"][1],
         "angle": data.get("angle", None)
     }
 
-def normalize_angle(angle):
-    return angle % 360
 
-def angle_diff(target, current):
-    """
-    Differenz zwischen Zielwinkel und aktuellem Winkel.
-    Ergebnis: -180 bis +180 Grad.
-    """
-    return (target - current + 180) % 360 - 180
+def on_connect(client, userdata, flags, rc):
+    print("Connected:", rc)
+    client.subscribe("robot_pos/all")
 
-def angle_to_target(robot, target):
-    dx = target["x"] - robot["x"]
-    dy = target["y"] - robot["y"]
 
-    target_angle = math.degrees(math.atan2(dy, dx))
-    return normalize_angle(target_angle)
+def on_message(client, userdata, msg):
+    global robot_positions
+    try:
+        robot_positions = json.loads(msg.payload.decode())
+    except json.JSONDecodeError:
+        print("Invalid JSON")
 
-def distance(robot, target):
-    dx = target["x"] - robot["x"]
-    dy = target["y"] - robot["y"]
 
-    return math.sqrt(dx * dx + dy * dy)
+pipuck = PiPuck(epuck_version=2)
+
+
+def set_motors(left, right):
+    pipuck.epuck.set_motor_speeds(
+        clamp_speed(left),
+        clamp_speed(right)
+    )
+
+
+def stop():
+    set_motors(0, 0)
+
+
+def turn_left():
+    set_motors(-TURN_SPEED, TURN_SPEED)
+
+
+def turn_right():
+    set_motors(TURN_SPEED, -TURN_SPEED)
+
+
+def charge_forward():
+    set_motors(CHARGE_SPEED, CHARGE_SPEED)
+
 
 client = mqtt.Client()
 client.on_connect = on_connect
@@ -69,42 +107,81 @@ client.loop_start()
 try:
     while True:
         robot = get_state(MY_ID)
-        obj = get_state(TARGET_ID)
+        target = get_state(TARGET_ID)
 
         if robot is None:
-            print("Keine Roboterposition. Sichtbare IDs:", list(robot_positions.keys()))
-            time.sleep(0.5)
+            print("Keine eigene Position. Sichtbare IDs:", list(robot_positions.keys()))
+            stop()
+            time.sleep(0.2)
             continue
 
-        if obj is None:
-            print("Objekt 44 nicht sichtbar. Sichtbare IDs:", list(robot_positions.keys()))
-            time.sleep(0.5)
+        if target is None:
+            print(f"Target {TARGET_ID} nicht mehr sichtbar / vom Feld. Stop.")
+            stop()
+            break
+
+        if robot["angle"] is None:
+            print("Kein Winkel für Roboter verfügbar.")
+            stop()
+            time.sleep(0.2)
             continue
 
-        target_angle = angle_to_target(robot, obj)
-        dist = distance(robot, obj)
+        current_angle = robot["angle"]
+        target_angle = angle_to_target(robot, target)
+        diff = angle_diff(target_angle, current_angle)
 
-        if robot["angle"] is not None:
-            diff = angle_diff(target_angle, robot["angle"])
+        if mode == "ALIGN":
+            if abs(diff) <= ALIGN_TOLERANCE:
+                stop()
+                time.sleep(0.1)
+
+                print(
+                    f"Aligned: angle={current_angle:.1f}, "
+                    f"target_angle={target_angle:.1f}, diff={diff:.1f}. "
+                    f"Charge for {CHARGE_DURATION}s."
+                )
+
+                charge_start_time = time.time()
+                mode = "CHARGE"
+
+            else:
+                # Falls er falsch herum dreht: turn_left/turn_right tauschen
+                if diff > 0:
+                    turn_right()
+                    turn_dir = "RIGHT"
+                else:
+                    turn_left()
+                    turn_dir = "LEFT"
+
+                print(
+                    f"mode=ALIGN | robot=({robot['x']:.2f},{robot['y']:.2f}) "
+                    f"target=({target['x']:.2f},{target['y']:.2f}) "
+                    f"angle={current_angle:.1f}, target_angle={target_angle:.1f}, "
+                    f"diff={diff:.1f}, turning={turn_dir}"
+                )
+
+        elif mode == "CHARGE":
+            charge_forward()
+
+            elapsed = time.time() - charge_start_time
 
             print(
-                f"Robot {MY_ID}: x={robot['x']:.3f}, y={robot['y']:.3f}, angle={robot['angle']:.1f}° | "
-                f"Object {TARGET_ID}: x={obj['x']:.3f}, y={obj['y']:.3f} | "
-                f"target_angle={target_angle:.1f}°, diff={diff:.1f}°, distance={dist:.3f}m"
+                f"mode=CHARGE | {elapsed:.2f}/{CHARGE_DURATION:.2f}s | "
+                f"robot=({robot['x']:.2f},{robot['y']:.2f}) "
+                f"target=({target['x']:.2f},{target['y']:.2f})"
             )
 
-        else:
-            print(
-                f"Robot {MY_ID}: x={robot['x']:.3f}, y={robot['y']:.3f} | "
-                f"Object {TARGET_ID}: x={obj['x']:.3f}, y={obj['y']:.3f} | "
-                f"target_angle={target_angle:.1f}°, distance={dist:.3f}m"
-            )
+            if elapsed >= CHARGE_DURATION:
+                stop()
+                time.sleep(0.1)
+                mode = "ALIGN"
 
-        time.sleep(0.2)
+        time.sleep(0.03)
 
 except KeyboardInterrupt:
     print("Stopping...")
 
 finally:
+    stop()
     client.loop_stop()
     client.disconnect()
