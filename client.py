@@ -13,13 +13,13 @@ X_MIN, X_MAX = 0.0, 2.0
 Y_MIN, Y_MAX = 0.0, 1.0
 BORDER_MARGIN = 0.12
 
-SPEED_DRIVE = 500
-SPEED_TURN  = 400
+SPEED_DRIVE = 300
+SPEED_TURN  = 200
 
 STEER_GAIN     = 3.5
 MAX_CORRECTION = 250
 AIM_THRESHOLD  = 10.0  # Grad – etwas großzügiger
-POS_TOL        = 0.08  # Meter
+POS_TOL        = 0.05  # Meter
 
 # ── Winkel-Kalibrierung ────────────────────────────────────────
 # Teste: Roboter zeigt physisch nach Osten (rechts) → was zeigt angle?
@@ -111,10 +111,10 @@ def is_on_border(pos):
     )
 
 CORNERS = [
-    (X_MAX - BORDER_MARGIN, Y_MAX - BORDER_MARGIN),
-    (X_MIN + BORDER_MARGIN, Y_MAX - BORDER_MARGIN),
-    (X_MIN + BORDER_MARGIN, Y_MIN + BORDER_MARGIN),
-    (X_MAX - BORDER_MARGIN, Y_MIN + BORDER_MARGIN),
+    (X_MAX - BORDER_MARGIN, Y_MAX - BORDER_MARGIN), # Ecke oben rechts
+    (X_MIN + BORDER_MARGIN, Y_MAX - BORDER_MARGIN), # Ecke oben links
+    (X_MIN + BORDER_MARGIN, Y_MIN + BORDER_MARGIN), # Ecke unten links
+    (X_MAX - BORDER_MARGIN, Y_MIN + BORDER_MARGIN), # Ecke unten rechts
 ]
 
 # ── State Machine ──────────────────────────────────────────────
@@ -156,7 +156,6 @@ try:
         diff = angle_diff(target_angle, pos["angle"])
 
         # ── Ziel erreicht ──────────────────────────────────────
-# ── Ziel erreicht ──────────────────────────────────────
         if d < POS_TOL:
             stop()
             print(f"Ziel ({tx:.2f},{ty:.2f}) erreicht!")
@@ -209,16 +208,20 @@ try:
 
         # ── DRIVE: Geradeaus mit Korrektur ─────────────────────
         elif state == "DRIVE":
-            # Zu stark abgewichen → neu ausrichten
             if abs(diff) > 40:
                 stop()
                 state = "TURN"
-                print(f"→ Kurskorrektur (diff={diff:+.1f}°), zurück zu TURN")
             else:
+                # Bremsrampe: Geschwindigkeit reduzieren, wenn Ziel näher als 20cm
+                current_speed = SPEED_DRIVE
+                if d < 0.20:
+                    current_speed = max(150, SPEED_DRIVE * (d / 0.20))
+
                 correction = STEER_GAIN * diff
                 correction = max(-MAX_CORRECTION, min(MAX_CORRECTION, correction))
-                left  = max(150, SPEED_DRIVE - correction)
-                right = max(150, SPEED_DRIVE + correction)
+                
+                left  = max(100, current_speed - correction)
+                right = max(100, current_speed + correction)
                 set_motors(left, right)
 
                 print(
