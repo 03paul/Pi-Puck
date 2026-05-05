@@ -7,235 +7,116 @@ from pipuck.pipuck import PiPuck
 # ── Konfiguration ──────────────────────────────────────────────
 BROKER = "192.168.178.43"
 PORT   = 1883
-MY_ID  = 38
+MY_ID  = "39"
+TARGET_ID = "44"
 
+# Spielfeld-Grenzen
 X_MIN, X_MAX = 0.0, 2.0
 Y_MIN, Y_MAX = 0.0, 1.0
-BORDER_MARGIN = 0.12
 
-SPEED_DRIVE = 300
-SPEED_TURN  = 200
-
-STEER_GAIN     = 3.5
-MAX_CORRECTION = 250
-AIM_THRESHOLD  = 10.0  # Grad – etwas großzügiger
-POS_TOL        = 0.05  # Meter
-
-# ── Winkel-Kalibrierung ────────────────────────────────────────
-# Teste: Roboter zeigt physisch nach Osten (rechts) → was zeigt angle?
-# Trage diesen Wert hier ein:
-ANGLE_NORTH_OFFSET = 90.0  # 90 = Roboter nutzt 0°=Norden (Standard)
-#                            0  = Roboter nutzt 0°=Osten
-# Dreht er falsch herum beim Ausrichten:
-TURN_SIGN = 1   # auf -1 setzen
-# ──────────────────────────────────────────────────────────────
+# Parameter für den Angriff
+ATTACK_OFFSET = 0.25  # Distanz hinter dem Obstacle (in Metern)
+STRIKE_ZONE   = 0.10  # Ab dieser Nähe zum Attack-Point wird "geschoben"
+MAX_SPEED     = 600
+STEER_GAIN    = 4.5   # Wie aggressiv er den Kurs korrigiert
 
 robot_positions = {}
 pipuck = PiPuck(epuck_version=2)
 
-def clamp(v):
-    return max(-1024, min(1024, int(v)))
+# ── Hilfsfunktionen ────────────────────────────────────────────
+def clamp(v): return max(-1000, min(1000, int(v)))
 
-def set_motors(left, right):
-    pipuck.epuck.set_motor_speeds(clamp(left), clamp(right))
+def set_motors(l, r): pipuck.epuck.set_motor_speeds(clamp(l), clamp(r))
 
-def stop():
-    set_motors(0, 0)
+def get_pos(rid):
+    d = robot_positions.get(str(rid))
+    if not d: return None
+    return {"x": d["position"][0], "y": d["position"][1], "angle": d["angle"] % 360}
 
-def on_connect(client, userdata, flags, rc):
-    print("Connected:", rc)
-    client.subscribe("robot_pos/all")
-
-def on_message(client, userdata, msg):
+def on_message(c, u, msg):
     global robot_positions
-    try:
-        robot_positions = json.loads(msg.payload.decode())
-    except json.JSONDecodeError:
-        pass
+    try: robot_positions = json.loads(msg.payload.decode())
+    except: pass
 
+# ── Vektor-Mathematik ──────────────────────────────────────────
+def get_nearest_exit(target_pos):
+    """Berechnet den Punkt auf der Grenze, der dem Obstacle am nächsten ist."""
+    tx, ty = target_pos["x"], target_pos["y"]
+    dist_to_edge = [
+        (tx - X_MIN, (X_MIN - 0.2, ty)), # West
+        (X_MAX - tx, (X_MAX + 0.2, ty)), # Ost
+        (ty - Y_MIN, (tx, Y_MIN - 0.2)), # Süd
+        (Y_MAX - ty, (tx, Y_MAX + 0.2))  # Nord
+    ]
+    return min(dist_to_edge, key=lambda x: x[0])[1]
+
+def get_attack_vector(target_pos, exit_point):
+    """Berechnet den Punkt HINTER dem Obstacle."""
+    dx = target_pos["x"] - exit_point[0]
+    dy = target_pos["y"] - exit_point[1]
+    mag = math.hypot(dx, dy)
+    # Einheitsvektor von Exit zu Target, dann skaliert um OFFSET
+    ax = target_pos["x"] + (dx / mag) * ATTACK_OFFSET
+    ay = target_pos["y"] + (dy / mag) * ATTACK_OFFSET
+    return ax, ay
+
+# ── MQTT Setup ─────────────────────────────────────────────────
 client = mqtt.Client()
-client.on_connect = on_connect
 client.on_message = on_message
 client.connect(BROKER, PORT, 60)
+client.subscribe("robot_pos/all")
 client.loop_start()
 
-def get_my_position():
-    rid = str(MY_ID)
-    if rid not in robot_positions:
-        return None
-    d = robot_positions[rid]
-    return {
-        "x":     d["position"][0],
-        "y":     d["position"][1],
-        "angle": d["angle"] % 360
-    }
-
-def angle_diff(target, current):
-    """Kürzeste Differenz, positiv = rechts drehen."""
-    return (target - current + 180) % 360 - 180
-
-def angle_to_point(pos, tx, ty):
-    """
-    Zielwinkel im gleichen Koordinatensystem wie pos['angle'].
-    ANGLE_NORTH_OFFSET=90 → 0°=Norden, CW (typisch für Tracking-Systeme)
-    """
-    dx = tx - pos["x"]
-    dy = ty - pos["y"]
-    # atan2 standard: 0°=Osten, CCW
-    deg_east = math.degrees(math.atan2(dy, dx))
-    # Umrechnen auf Roboter-Koordinatensystem
-    return (deg_east + ANGLE_NORTH_OFFSET) % 360
-
-def dist_to(pos, tx, ty):
-    return math.hypot(tx - pos["x"], ty - pos["y"])
-
-def nearest_border_point(pos):
-    x, y = pos["x"], pos["y"]
-    m = BORDER_MARGIN
-    d_left   = x - X_MIN
-    d_right  = X_MAX - x
-    d_bottom = y - Y_MIN
-    d_top    = Y_MAX - y
-    min_d = min(d_left, d_right, d_bottom, d_top)
-    if min_d == d_left:   return (X_MIN + m, y)
-    if min_d == d_right:  return (X_MAX - m, y)
-    if min_d == d_bottom: return (x, Y_MIN + m)
-    return                       (x, Y_MAX - m)
-
-def is_on_border(pos):
-    return (
-        pos["x"] <= X_MIN + BORDER_MARGIN or
-        pos["x"] >= X_MAX - BORDER_MARGIN or
-        pos["y"] <= Y_MIN + BORDER_MARGIN or
-        pos["y"] >= Y_MAX - BORDER_MARGIN
-    )
-
-CORNERS = [
-    (X_MAX - BORDER_MARGIN, Y_MAX - BORDER_MARGIN), # Ecke oben rechts
-    (X_MIN + BORDER_MARGIN, Y_MAX - BORDER_MARGIN), # Ecke oben links
-    (X_MIN + BORDER_MARGIN, Y_MIN + BORDER_MARGIN), # Ecke unten links
-    (X_MAX - BORDER_MARGIN, Y_MIN + BORDER_MARGIN), # Ecke unten rechts
-]
-
-# ── State Machine ──────────────────────────────────────────────
-phase        = "GOTO_BORDER"
-corner_index = 0
-state        = "TURN"   # "TURN" oder "DRIVE"
-tx, ty       = 0.0, 0.0
-
-def compute_target(pos):
-    global tx, ty
-    if phase == "GOTO_BORDER":
-        tx, ty = nearest_border_point(pos)
-    else:
-        tx, ty = CORNERS[corner_index]
-
-# Warte auf Position
-print("Warte auf Positionsdaten...")
-while True:
-    pos = get_my_position()
-    if pos:
-        break
-    time.sleep(0.1)
-
-compute_target(pos)
-target_angle = angle_to_point(pos, tx, ty)
-print(f"Start! pos=({pos['x']:.2f},{pos['y']:.2f}) angle={pos['angle']:.1f}°")
-print(f"Ziel: ({tx:.2f},{ty:.2f}) → target_angle={target_angle:.1f}°")
+print("Suche Obstacle 44...")
 
 try:
     while True:
-        pos = get_my_position()
-        if pos is None:
-            stop()
-            time.sleep(0.2)
+        me = get_pos(MY_ID)
+        target = get_pos(TARGET_ID)
+
+        if not me or not target:
+            set_motors(0, 0)
+            time.sleep(0.1)
             continue
 
-        d = dist_to(pos, tx, ty)
-        target_angle = angle_to_point(pos, tx, ty)
-        diff = angle_diff(target_angle, pos["angle"])
+        # 1. Wo muss das Obstacle hin?
+        exit_pt = get_nearest_exit(target)
+        # 2. Wo muss ich mich aufstellen?
+        attack_pt = get_attack_vector(target, exit_pt)
+        
+        # Distanz-Checks
+        dist_to_attack = math.hypot(attack_pt[0] - me["x"], attack_pt[1] - me["y"])
+        dist_to_target = math.hypot(target["x"] - me["x"], target["y"] - me["y"])
 
-        # ── Ziel erreicht ──────────────────────────────────────
-        if d < POS_TOL:
-            stop()
-            print(f"Ziel ({tx:.2f},{ty:.2f}) erreicht!")
+        # 3. Zielwahl: Wenn ich am Attack-Point bin, ramme das Obstacle direkt zum Exit
+        if dist_to_attack < STRIKE_ZONE:
+            goal_x, goal_y = exit_pt[0], exit_pt[1]
+            speed = MAX_SPEED
+            mode = "RAMMING"
+        else:
+            goal_x, goal_y = attack_pt
+            speed = 400
+            mode = "POSITIONING"
 
-            if phase == "GOTO_BORDER":
-                # WECHSEL ERZWINGEN: Wenn wir nah genug am berechneten Randpunkt sind, 
-                # wechseln wir in den Follow-Modus.
-                print("→ Rand-Punkt erreicht, starte FOLLOW_BORDER")
-                phase = "FOLLOW_BORDER"
-                
-                # Finde die nächste Ecke, um den Rundlauf zu starten
-                corner_index = min(
-                    range(len(CORNERS)),
-                    key=lambda i: math.hypot(
-                        CORNERS[i][0] - pos["x"],
-                        CORNERS[i][1] - pos["y"]
-                    )
-                )
-            else:
-                # In der FOLLOW_BORDER Phase: Einfach zur nächsten Ecke springen
-                corner_index = (corner_index + 1) % len(CORNERS)
-                print(f"→ Nächste Ecke: {corner_index} = {CORNERS[corner_index]}")
+        # 4. Dynamische Kurskorrektur (P-Regler)
+        target_angle_rad = math.atan2(goal_y - me["y"], goal_x - me["x"])
+        # Umrechnung auf dein 90°-Offset-System (Norden=0)
+        target_angle_deg = (math.degrees(target_angle_rad) + 90) % 360
+        
+        diff = (target_angle_deg - me["angle"] + 180) % 360 - 180
+        
+        # Wenn der Winkel extrem falsch ist, erst auf der Stelle drehen
+        if abs(diff) > 60:
+            turn = 300 if diff > 0 else -300
+            set_motors(turn, -turn)
+        else:
+            # Während der Fahrt korrigieren
+            correction = diff * STEER_GAIN
+            set_motors(speed - correction, speed + correction)
 
-            # Neues Ziel basierend auf der neuen Phase/Ecke berechnen
-            compute_target(pos)
-            state = "TURN" # Zuerst wieder ausrichten
-            print(f"Neues Ziel: ({tx:.2f},{ty:.2f}), state=TURN")
-            time.sleep(0.2) # Kurz warten für Stabilität
-            continue
-
-        # ── TURN: Ausrichten ───────────────────────────────────
-        if state == "TURN":
-            print(
-                f"[TURN] phase={phase} | "
-                f"pos=({pos['x']:.2f},{pos['y']:.2f}) angle={pos['angle']:.1f}° "
-                f"→ ({tx:.2f},{ty:.2f}) target={target_angle:.1f}° diff={diff:+.1f}°"
-            )
-
-            if abs(diff) <= AIM_THRESHOLD:
-                stop()
-                time.sleep(0.1)  # kurze Pause damit Motoren stoppen
-                state = "DRIVE"
-                print("→ Ausgerichtet, starte DRIVE")
-            else:
-                # diff > 0 = Ziel ist rechts → linkes Rad schneller
-                if TURN_SIGN * diff > 0:
-                    set_motors( SPEED_TURN, -SPEED_TURN)   # dreht rechts
-                else:
-                    set_motors(-SPEED_TURN,  SPEED_TURN)   # dreht links
-
-        # ── DRIVE: Geradeaus mit Korrektur ─────────────────────
-        elif state == "DRIVE":
-            if abs(diff) > 40:
-                stop()
-                state = "TURN"
-            else:
-                # Bremsrampe: Geschwindigkeit reduzieren, wenn Ziel näher als 20cm
-                current_speed = SPEED_DRIVE
-                if d < 0.20:
-                    current_speed = max(150, SPEED_DRIVE * (d / 0.20))
-
-                correction = STEER_GAIN * diff
-                correction = max(-MAX_CORRECTION, min(MAX_CORRECTION, correction))
-                
-                left  = max(100, current_speed - correction)
-                right = max(100, current_speed + correction)
-                set_motors(left, right)
-
-                print(
-                    f"[DRIVE] phase={phase} | "
-                    f"pos=({pos['x']:.2f},{pos['y']:.2f}) angle={pos['angle']:.1f}° "
-                    f"→ ({tx:.2f},{ty:.2f}) d={d:.3f} diff={diff:+.1f}° "
-                    f"L={int(left)} R={int(right)}"
-                )
-
+        print(f"Mode: {mode} | Dist to Attack: {dist_to_attack:.2f}m | Diff: {diff:.1f}°")
         time.sleep(0.05)
 
 except KeyboardInterrupt:
-    print("Stopping...")
-finally:
-    stop()
+    set_motors(0, 0)
     client.loop_stop()
-    client.disconnect()
