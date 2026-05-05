@@ -10,7 +10,7 @@ MY_ID      = 39
 
 # Spielfeld-Grenzen (anpassen!)
 FIELD_MIN_X = 0.0
-FIELD_MAX_X = 1.0
+FIELD_MAX_X = 2.0
 FIELD_MIN_Y = 0.0
 FIELD_MAX_Y = 1.0
 
