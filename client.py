@@ -1,64 +1,122 @@
-import paho.mqtt.client as mqtt
-import json
+import sys
+import tty
+import termios
+import select
 import time
+from pipuck.pipuck import PiPuck
 
-BROKER = "192.168.178.43"
-PORT = 1883
+# =========================
+# CONFIG
+# =========================
 
-MY_ID = 38  
+SPEED_FORWARD = 600
+SPEED_TURN = 500
 
-robot_positions = {}
+LOOP_DELAY = 0.05
 
-def on_connect(client, userdata, flags, rc):
-    print("Connected:", rc)
-    client.subscribe("robot_pos/all")
-
-def on_message(client, userdata, msg):
-    global robot_positions
-    try:
-        robot_positions = json.loads(msg.payload.decode())
-    except json.JSONDecodeError:
-        print("Invalid JSON")
+pipuck = PiPuck(epuck_version=2)
 
 
-def get_my_position():
-    rid = str(MY_ID)
+# =========================
+# MOTOR CONTROL
+# =========================
 
-    if rid not in robot_positions:
-        return None
+def clamp_speed(v):
+    return max(-1024, min(1024, int(v)))
 
-    data = robot_positions[rid]
 
-    return {
-        "x": data["position"][0],
-        "y": data["position"][1],
-        "angle": data["angle"]
-    }
+def set_motors(left, right):
+    pipuck.epuck.set_motor_speeds(
+        clamp_speed(left),
+        clamp_speed(right)
+    )
 
-client = mqtt.Client()
-client.on_connect = on_connect
-client.on_message = on_message
 
-client.connect(BROKER, PORT, 60)
-client.loop_start()
+def stop():
+    set_motors(0, 0)
+
+
+def forward():
+    set_motors(SPEED_FORWARD, SPEED_FORWARD)
+
+
+def backward():
+    set_motors(-SPEED_FORWARD, -SPEED_FORWARD)
+
+
+def turn_left():
+    set_motors(-SPEED_TURN, SPEED_TURN)
+
+
+def turn_right():
+    set_motors(SPEED_TURN, -SPEED_TURN)
+
+
+# =========================
+# KEYBOARD INPUT
+# =========================
+
+def key_pressed():
+    """
+    Non-blocking key read from terminal.
+    Returns one character or None.
+    """
+    dr, _, _ = select.select([sys.stdin], [], [], 0)
+    if dr:
+        return sys.stdin.read(1)
+    return None
+
+
+# =========================
+# MAIN
+# =========================
+
+old_settings = termios.tcgetattr(sys.stdin)
 
 try:
-    while True:
-        pos = get_my_position()
+    tty.setcbreak(sys.stdin.fileno())
 
-        if pos is None:
-            print("Keine Position. Sichtbare IDs:", list(robot_positions.keys()))
-        else:
-            print(
-                f"ID={MY_ID} | "
-                f"x={pos['x']:.3f}, y={pos['y']:.3f}, angle={pos['angle']:.1f}"
-            )
-        
-        time.sleep(0.5)
+    print("Manual Pi-Puck control started.")
+    print("W = forward | S = backward | A = left | D = right | X = stop | Q = quit")
+
+    stop()
+
+    while True:
+        key = key_pressed()
+
+        if key is not None:
+            key = key.lower()
+
+            if key == "w":
+                print("Forward")
+                forward()
+
+            elif key == "s":
+                print("Backward")
+                backward()
+
+            elif key == "a":
+                print("Left")
+                turn_left()
+
+            elif key == "d":
+                print("Right")
+                turn_right()
+
+            elif key == "x":
+                print("Stop")
+                stop()
+
+            elif key == "q":
+                print("Quit")
+                break
+
+        time.sleep(LOOP_DELAY)
 
 except KeyboardInterrupt:
-    print("Stopping...")
+    print("\nKeyboardInterrupt")
 
 finally:
-    client.loop_stop()
-    client.disconnect()
+    stop()
+    termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
+    print("Robot stopped.")
