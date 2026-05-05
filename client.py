@@ -9,38 +9,28 @@ BROKER = "192.168.178.43"
 PORT   = 1883
 MY_ID  = 38
 
-# Spielfeld
 X_MIN, X_MAX = 0.0, 2.0
 Y_MIN, Y_MAX = 0.0, 1.0
 BORDER_MARGIN = 0.12
 
-# Geschwindigkeiten (PiPuck: -1024 … 1024)
 SPEED_DRIVE = 500
 SPEED_TURN  = 400
 
-# Regler
-STEER_GAIN      = 3.5
-MAX_CORRECTION  = 250
-AIM_THRESHOLD   = 8.0   # Grad – Toleranz beim Ausrichten
-POS_TOL         = 0.08  # Meter – Toleranz Zielpunkt erreicht
+STEER_GAIN     = 3.5
+MAX_CORRECTION = 250
+AIM_THRESHOLD  = 10.0  # Grad – etwas großzügiger
+POS_TOL        = 0.08  # Meter
 
-# Winkel-Vorzeichen anpassen falls nötig
-TURN_SIGN    =  1   # -1 falls er falsch herum dreht
-STEERING_SIGN = 1   # -1 falls er beim Fahren weglenkt
-ANGLE_OFFSET  = 0.0 # falls Winkel systematisch falsch
-
-# Ecken des Rand-Pfads (Uhrzeigersinn)
-CORNERS = [
-    (X_MAX - BORDER_MARGIN, Y_MAX - BORDER_MARGIN),  # oben-rechts
-    (X_MIN + BORDER_MARGIN, Y_MAX - BORDER_MARGIN),  # oben-links
-    (X_MIN + BORDER_MARGIN, Y_MIN + BORDER_MARGIN),  # unten-links
-    (X_MAX - BORDER_MARGIN, Y_MIN + BORDER_MARGIN),  # unten-rechts
-]
+# ── Winkel-Kalibrierung ────────────────────────────────────────
+# Teste: Roboter zeigt physisch nach Osten (rechts) → was zeigt angle?
+# Trage diesen Wert hier ein:
+ANGLE_NORTH_OFFSET = 90.0  # 90 = Roboter nutzt 0°=Norden (Standard)
+#                            0  = Roboter nutzt 0°=Osten
+# Dreht er falsch herum beim Ausrichten:
+TURN_SIGN = 1   # auf -1 setzen
 # ──────────────────────────────────────────────────────────────
 
 robot_positions = {}
-
-# ── PiPuck ─────────────────────────────────────────────────────
 pipuck = PiPuck(epuck_version=2)
 
 def clamp(v):
@@ -52,7 +42,6 @@ def set_motors(left, right):
 def stop():
     set_motors(0, 0)
 
-# ── MQTT ───────────────────────────────────────────────────────
 def on_connect(client, userdata, flags, rc):
     print("Connected:", rc)
     client.subscribe("robot_pos/all")
@@ -62,7 +51,7 @@ def on_message(client, userdata, msg):
     try:
         robot_positions = json.loads(msg.payload.decode())
     except json.JSONDecodeError:
-        print("Invalid JSON")
+        pass
 
 client = mqtt.Client()
 client.on_connect = on_connect
@@ -78,32 +67,35 @@ def get_my_position():
     return {
         "x":     d["position"][0],
         "y":     d["position"][1],
-        "angle": (d["angle"] + ANGLE_OFFSET) % 360
+        "angle": d["angle"] % 360
     }
 
-# ── Geometrie-Helfer ───────────────────────────────────────────
-def normalize(a):
-    return a % 360
-
 def angle_diff(target, current):
+    """Kürzeste Differenz, positiv = rechts drehen."""
     return (target - current + 180) % 360 - 180
 
 def angle_to_point(pos, tx, ty):
+    """
+    Zielwinkel im gleichen Koordinatensystem wie pos['angle'].
+    ANGLE_NORTH_OFFSET=90 → 0°=Norden, CW (typisch für Tracking-Systeme)
+    """
     dx = tx - pos["x"]
     dy = ty - pos["y"]
-    return normalize(math.degrees(math.atan2(dy, dx)))
+    # atan2 standard: 0°=Osten, CCW
+    deg_east = math.degrees(math.atan2(dy, dx))
+    # Umrechnen auf Roboter-Koordinatensystem
+    return (deg_east + ANGLE_NORTH_OFFSET) % 360
 
-def dist_to_point(pos, tx, ty):
+def dist_to(pos, tx, ty):
     return math.hypot(tx - pos["x"], ty - pos["y"])
 
 def nearest_border_point(pos):
-    """Nächster Punkt auf dem Rand."""
     x, y = pos["x"], pos["y"]
+    m = BORDER_MARGIN
     d_left   = x - X_MIN
     d_right  = X_MAX - x
     d_bottom = y - Y_MIN
     d_top    = Y_MAX - y
-    m = BORDER_MARGIN
     min_d = min(d_left, d_right, d_bottom, d_top)
     if min_d == d_left:   return (X_MIN + m, y)
     if min_d == d_right:  return (X_MAX - m, y)
@@ -118,108 +110,118 @@ def is_on_border(pos):
         pos["y"] >= Y_MAX - BORDER_MARGIN
     )
 
-# ── Fahr-Funktionen ────────────────────────────────────────────
-def turn_towards(pos, tx, ty):
-    """Dreht auf der Stelle Richtung (tx, ty). Gibt True zurück wenn fertig."""
-    target_angle = angle_to_point(pos, tx, ty)
-    diff = angle_diff(target_angle, pos["angle"])
-
-    if abs(diff) <= AIM_THRESHOLD:
-        stop()
-        return True
-
-    if TURN_SIGN * diff > 0:
-        set_motors( SPEED_TURN, -SPEED_TURN)
-    else:
-        set_motors(-SPEED_TURN,  SPEED_TURN)
-
-    return False
-
-def drive_towards(pos, tx, ty):
-    """Fährt mit Lenkkorrektur auf (tx, ty). Gibt True zurück wenn Ziel erreicht."""
-    if dist_to_point(pos, tx, ty) < POS_TOL:
-        return True
-
-    target_angle = angle_to_point(pos, tx, ty)
-    diff = angle_diff(target_angle, pos["angle"])
-
-    correction = STEERING_SIGN * STEER_GAIN * diff
-    correction = max(-MAX_CORRECTION, min(MAX_CORRECTION, correction))
-
-    left  = max(120, SPEED_DRIVE - correction)
-    right = max(120, SPEED_DRIVE + correction)
-
-    set_motors(left, right)
-    return False
+CORNERS = [
+    (X_MAX - BORDER_MARGIN, Y_MAX - BORDER_MARGIN),
+    (X_MIN + BORDER_MARGIN, Y_MAX - BORDER_MARGIN),
+    (X_MIN + BORDER_MARGIN, Y_MIN + BORDER_MARGIN),
+    (X_MAX - BORDER_MARGIN, Y_MIN + BORDER_MARGIN),
+]
 
 # ── State Machine ──────────────────────────────────────────────
 phase        = "GOTO_BORDER"
 corner_index = 0
-aimed        = False   # True sobald wir auf die aktuelle Ecke ausgerichtet sind
+state        = "TURN"   # "TURN" oder "DRIVE"
+tx, ty       = 0.0, 0.0
 
+def compute_target(pos):
+    global tx, ty
+    if phase == "GOTO_BORDER":
+        tx, ty = nearest_border_point(pos)
+    else:
+        tx, ty = CORNERS[corner_index]
+
+# Warte auf Position
 print("Warte auf Positionsdaten...")
-while not robot_positions:
+while True:
+    pos = get_my_position()
+    if pos:
+        break
     time.sleep(0.1)
-print("Los!")
+
+compute_target(pos)
+target_angle = angle_to_point(pos, tx, ty)
+print(f"Start! pos=({pos['x']:.2f},{pos['y']:.2f}) angle={pos['angle']:.1f}°")
+print(f"Ziel: ({tx:.2f},{ty:.2f}) → target_angle={target_angle:.1f}°")
 
 try:
     while True:
         pos = get_my_position()
-
         if pos is None:
-            print("Keine Position. Sichtbare IDs:", list(robot_positions.keys()))
             stop()
             time.sleep(0.2)
             continue
 
-        # ── Phase 1: Zum Rand fahren ───────────────────────────
-        if phase == "GOTO_BORDER":
-            if is_on_border(pos):
-                print("Rand erreicht → FOLLOW_BORDER")
-                phase  = "FOLLOW_BORDER"
-                aimed  = False
-                # Starte bei der nächsten Ecke
-                corner_index = min(
-                    range(len(CORNERS)),
-                    key=lambda i: math.hypot(
-                        CORNERS[i][0] - pos["x"],
-                        CORNERS[i][1] - pos["y"]
+        d = dist_to(pos, tx, ty)
+        target_angle = angle_to_point(pos, tx, ty)
+        diff = angle_diff(target_angle, pos["angle"])
+
+        # ── Ziel erreicht ──────────────────────────────────────
+        if d < POS_TOL:
+            stop()
+            print(f"Ziel ({tx:.2f},{ty:.2f}) erreicht!")
+
+            if phase == "GOTO_BORDER":
+                if is_on_border(pos):
+                    print("→ Rand erreicht, starte FOLLOW_BORDER")
+                    phase = "FOLLOW_BORDER"
+                    corner_index = min(
+                        range(len(CORNERS)),
+                        key=lambda i: math.hypot(
+                            CORNERS[i][0] - pos["x"],
+                            CORNERS[i][1] - pos["y"]
+                        )
                     )
-                )
+                # sonst: neues Zwischenziel zum Rand
             else:
-                tx, ty = nearest_border_point(pos)
-                # Erst ausrichten, dann fahren
-                if not aimed:
-                    aimed = turn_towards(pos, tx, ty)
-                else:
-                    arrived = drive_towards(pos, tx, ty)
-                    if arrived:
-                        aimed = False
-                print(
-                    f"GOTO_BORDER | pos=({pos['x']:.2f},{pos['y']:.2f}) "
-                    f"angle={pos['angle']:.1f}° → Rand ({tx:.2f},{ty:.2f})"
-                )
-
-        # ── Phase 2: Am Rand entlang ───────────────────────────
-        elif phase == "FOLLOW_BORDER":
-            tx, ty = CORNERS[corner_index]
-            d = dist_to_point(pos, tx, ty)
-
-            # Ecke erreicht → nächste Ecke
-            if d < POS_TOL * 1.5:
                 corner_index = (corner_index + 1) % len(CORNERS)
-                aimed = False
-                print(f"Ecke erreicht → nächste Ecke {corner_index}: {CORNERS[corner_index]}")
-            else:
-                if not aimed:
-                    aimed = turn_towards(pos, tx, ty)
-                else:
-                    drive_towards(pos, tx, ty)
+                print(f"→ Nächste Ecke: {corner_index} = {CORNERS[corner_index]}")
 
+            compute_target(pos)
+            state = "TURN"
+            print(f"Neues Ziel: ({tx:.2f},{ty:.2f}), state=TURN")
+            time.sleep(0.1)
+            continue
+
+        # ── TURN: Ausrichten ───────────────────────────────────
+        if state == "TURN":
             print(
-                f"FOLLOW_BORDER | pos=({pos['x']:.2f},{pos['y']:.2f}) "
-                f"angle={pos['angle']:.1f}° → Ecke {corner_index} ({tx:.2f},{ty:.2f}) d={d:.3f}"
+                f"[TURN] phase={phase} | "
+                f"pos=({pos['x']:.2f},{pos['y']:.2f}) angle={pos['angle']:.1f}° "
+                f"→ ({tx:.2f},{ty:.2f}) target={target_angle:.1f}° diff={diff:+.1f}°"
             )
+
+            if abs(diff) <= AIM_THRESHOLD:
+                stop()
+                time.sleep(0.1)  # kurze Pause damit Motoren stoppen
+                state = "DRIVE"
+                print("→ Ausgerichtet, starte DRIVE")
+            else:
+                # diff > 0 = Ziel ist rechts → linkes Rad schneller
+                if TURN_SIGN * diff > 0:
+                    set_motors( SPEED_TURN, -SPEED_TURN)   # dreht rechts
+                else:
+                    set_motors(-SPEED_TURN,  SPEED_TURN)   # dreht links
+
+        # ── DRIVE: Geradeaus mit Korrektur ─────────────────────
+        elif state == "DRIVE":
+            # Zu stark abgewichen → neu ausrichten
+            if abs(diff) > 40:
+                stop()
+                state = "TURN"
+                print(f"→ Kurskorrektur (diff={diff:+.1f}°), zurück zu TURN")
+            else:
+                correction = STEER_GAIN * diff
+                correction = max(-MAX_CORRECTION, min(MAX_CORRECTION, correction))
+                left  = max(150, SPEED_DRIVE - correction)
+                right = max(150, SPEED_DRIVE + correction)
+                set_motors(left, right)
+
+                print(
+                    f"[DRIVE] phase={phase} | "
+                    f"pos=({pos['x']:.2f},{pos['y']:.2f}) angle={pos['angle']:.1f}° "
+                    f"→ ({tx:.2f},{ty:.2f}) d={d:.3f} diff={diff:+.1f}° "
+                    f"L={int(left)} R={int(right)}"
+                )
 
         time.sleep(0.05)
 
